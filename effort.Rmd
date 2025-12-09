@@ -1,0 +1,2387 @@
+---
+title: "Effort Titration"
+author: "Colin Dassow"
+output: bookdown::pdf_document2
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F, cache = T, tidy = TRUE, tidy.opts = list(width.cutoff = 60))
+
+rm(list=ls())
+library(wdnr.fmdb) # contact the lead author about the use of this package which is not currently available on CRAN
+library(tinytex)
+library(tidyverse)
+library(ggpubr)
+library(knitr)
+library(BayesianTools)
+library(moments)
+
+# set working directory to location of local copy of git repo
+setwd("C:/Users/dassocju/Documents/OAS_git_repos/Dassow.et.al._Creel_Efficiencies")
+
+#reading in objects that take a long time to produce to improve rendering speed of this document
+call=readRDS("creelDataSet_all.RData")
+# unlist, etc. to get back to individual dfs, filtering to completed trips only
+cserv=call[[1]]
+cvis=call[[2]]
+ccou=call[[3]]
+cint=call[[4]]; cint=cint[cint$trip.completed=='y',]
+cfish=call[[5]]; cfish=cfish[cfish$trip.complete=='y',]
+cfish.i=call[[6]]; cfish.i=cfish.i[cfish.i$trip.complete.flag=='y',] 
+
+# making list of CTWI lakes with creels
+lchar=get_fmdb_lakechar()
+ctwiWBIC=lchar[lchar$trtystat==1 & !is.na(lchar$trtystat),]
+ctwiWBIC.creel=ctwiWBIC$wbic[ctwiWBIC$wbic%in%cserv$wbic] # wbics in CTWI that have been creeled
+
+```
+
+# WDNR Creel Titration
+
+## Current Creel Data as Baseline
+
+DNR has amassed a large amount of inland creel information over many decades (`r range(cserv$year)`) across many waterbodies (n=`r length(unique(cserv$wbic))`).
+Using this data and functionality of `wdnr.fmdb` it is possible to calculate effort, catch, harvest, and harvest rate for multiple species for each unique creel survey conducted.
+This information can be further grouped by month, season, day type, etc. to provide insight into important temporal patterns in the fisheries metrics of interest.
+These calculations are accomplished fairly easily using the following code:
+
+```{r creel-data-retreival, eval=FALSE, echo=T}
+
+# this code is how one would normally pull creel data from the WDNR database using the wdnr.fmdb package, this would provide the user for the most up to date creel data available. For this study we did an initial pull and then save the result to keep it constant throughout the study.
+
+cserv=get_creel_surveys()
+cvis=get_creel_visits()
+ccou=get_creel_counts()
+cint=get_creel_int_party()
+cfish=get_creel_fish_data()
+
+```
+
+```{r baseline-fisheries-metrics, echo=T}
+# these functions from wdnr.fmdb calculate useful metrics from creel data
+
+ceff=calc_creel_effort(creel_count_data=ccou, creel_int_data=cint) 
+
+charv=calc_creel_harvest(creel_count_data = ccou, creel_int_data = cint,creel_fish_data = cfish) 
+
+charvR=calc_creel_harvest_rates(creel_fish_data=cfish)
+
+```
+
+
+```{r u-rate-calcs}
+
+## CALC EXPLOITATION RATES ####
+
+tagdat=read.csv("tags_and_marks.csv") # marking data from fmdb since the package function URLs didn't seem to be working this was downloaded manually from the database here: https://dnr.wisconsin.gov/topic/Fishing/data/infosystem.html
+tagdat$County=standardize_county_names(tagdat$County)
+tagdat$Gear=standardize_string(tagdat$Gear)
+tagdat$Waterbody.Name=standardize_waterbody_names(tagdat$Waterbody.Name)
+
+fndat=tagdat%>% # this is just in case we care what type of mark is there, but I'm going to overwrite this for now and just get total number marked.
+  filter(WBIC%in%ctwiWBIC.creel & Species.Code=="X22" & Gear=="fyke_net", !is.na(Mark.Given) & Mark.Given!="")%>%
+  group_by(WBIC, Waterbody.Name,Survey.Year,Survey.Begin.Date,Survey.End.Date,Survey.Seq.No,Mark.Given)%>%
+  summarise(nFish=sum(Number.of.Fish))
+
+# now summing across all types of marks
+fndat=tagdat%>% 
+  filter(WBIC%in%ctwiWBIC.creel & Species.Code=="X22" & Gear=="fyke_net", !is.na(Mark.Given) & Mark.Given!="")%>%
+  group_by(WBIC, Waterbody.Name,Survey.Year,Survey.Begin.Date,Survey.End.Date,Survey.Seq.No)%>%
+  summarise(nFish=sum(Number.of.Fish))%>%
+  mutate(Survey.Begin.Date=lubridate::mdy(Survey.Begin.Date),
+         Survey.End.Date=lubridate::mdy(Survey.End.Date),
+         begin.md=format(Survey.Begin.Date, "%m-%d"),
+         end.md=format(Survey.End.Date, "%m-%d"))%>%
+  filter(begin.md<"06-01") # getting rid of any marking surveys that may have taken place well after fishing season opened.
+
+fdat=fndat%>% # now that I have only surveys I want, pooling across start and end dates within a year to create an annual total number marked for comparison to creel data
+  group_by(WBIC, Waterbody.Name, Survey.Year)%>%
+  summarise(nFN.marked=sum(nFish))
+
+# table of marks found during creel surveys
+crRecap=cfish.i%>%
+  filter(species.code=="X22" & wbic%in%ctwiWBIC.creel)%>%
+  mutate(month=month(sample.date),
+         daytype=ifelse(wday(sample.date)%in%c(1,7),"weekend","weekday"))%>%
+  group_by(wbic, year,survey.seq.no,survey.begin.date,survey.end.date, mark.found,month,daytype)%>%
+  summarise(nfish=sum(fish.count)) # number of fish of each mark typed returned in that creel
+crRecap=crRecap%>% # now throwing out mark type and just taking overall number of marks recapped that month for that survey.
+  group_by(wbic, year, survey.seq.no, survey.begin.date, survey.end.date,month,daytype)%>%
+  summarise(n.marks.recapped=sum(nfish[!is.na(mark.found)]),
+            totalFishExamined=sum(nfish))
+
+# spp.harvest is the column that has the estimate of the harvest for that species in that strata
+harvestEstimates=charv%>%
+  filter(species.code=="X22" & wbic%in%ctwiWBIC.creel)%>%
+  select(year,wbic,survey.seq.no, month, daytype,spp.harvest,harvest,total.harvest,total.spp.harvest)
+
+# combining harvest estimates with marked proportion estimate to get total number of marks harvested
+
+markHarvEst=crRecap%>%
+  left_join(harvestEstimates)%>%
+  mutate(markHarvEstimate=(n.marks.recapped/totalFishExamined)*spp.harvest)
+
+ang.exp=markHarvEst%>%
+  left_join(fdat, by=c("wbic"="WBIC","year"="Survey.Year"))%>%
+  mutate(exp.rate=markHarvEstimate/nFN.marked) # looking at the lake-years without data to see if there's a problem with my code or just missing data
+# looks like it's either cases were no fish were marked in spring fyking for that creel survey or if for a specific strata no walleye were harvested or no marked walleye were harvested, either of those will throw an NA in the exploitation rate calculation
+
+# there are 6 observation where the number of marks returned was higher than what was marked, I'm throwing these out.
+ang.exp=ang.exp[!is.na(ang.exp$exp.rate) & ang.exp$exp.rate<1.0,]
+
+ang.exp=ang.exp%>%
+  group_by(survey.seq.no)%>%
+  summarise(meanU=mean(exp.rate,na.rm = T),
+            exp.rate.sd=sd(exp.rate,na.rm = T))
+
+# now I have exploitation rates and the total effort estimates that come with
+
+```
+
+```{r thinning data}
+## CREATING REDUCED DATASETS ####
+
+# next I want to make a few scenarios with 'reduced' data, a 'noWinter' scenario, 'May-August' scenario, and 3 % removals (0.25 weekdays, 0.5 weekdays, 0.5 weekend)
+
+ceff.ct=ceff%>% # creel effort estimates on a per hectare of water basis
+  filter(wbic%in%ctwiWBIC.creel)%>%
+  left_join(lchar[,c(1,15)])%>%
+  mutate(annual.eff.hectare=total.effort/(lake.area/2.47)) # conversion to hectares
+
+ifish=cfish.i%>% # making a data frame to add my groupings too so I can leave cfish.i alone
+  filter(species.code=="X22" & wbic%in%ctwiWBIC.creel)%>%
+  mutate(daytype=ifelse(wday(sample.date)%in%c(1,7),"weekend","weekday"),
+         month=month(sample.date),
+         season=ifelse(month%in%4:10,"openwater","winter"))
+
+iharv=charv%>% # making a separate data frame to add groupings to so I can leave charv alone
+  filter(species.code=="X22" & wbic%in%ctwiWBIC.creel)%>%
+  mutate(season=ifelse(month%in%4:10,"openwater","winter"))
+
+# now making a reduced dataframe for each scenario
+
+###### NO WINTER ####
+
+eff.nw=ceff.ct%>%
+  filter(season!='winter')%>%
+  left_join(lchar[,c(1,15)])%>%
+  mutate(annual.eff.hectare=total.effort/(lake.area/2.47))
+
+ifish.nw=ifish%>%
+  filter(season=="openwater")%>%
+  group_by(wbic, year,survey.seq.no,survey.begin.date,survey.end.date, mark.found,month,daytype)%>%
+  summarise(nfish=sum(fish.count)) # number of fish of each mark typed returned in that creel
+
+ifish.nw=ifish.nw%>% # now throwing out mark type and just taking overall number of marks recapped that month for that survey.
+  group_by(wbic, year, survey.seq.no, survey.begin.date, survey.end.date,month,daytype)%>%
+  summarise(n.marks.recapped=sum(nfish[!is.na(mark.found)]),
+            totalFishExamined=sum(nfish))
+
+# spp.harvest is the column that has the estimate of the harvest for that species in that strata
+harvestEstimates.nw=iharv%>%
+  filter(season=="openwater")%>%
+  select(year,wbic,survey.seq.no, month, daytype,spp.harvest,harvest,total.harvest,total.spp.harvest)
+
+# combining harvest estimates with marked proportion estimate to get total number of marks harvested
+
+markHarvEst.nw=ifish.nw%>%
+  left_join(harvestEstimates.nw)%>%
+  mutate(markHarvEstimate=(n.marks.recapped/totalFishExamined)*spp.harvest)
+
+ang.exp.nw=markHarvEst.nw%>%
+  left_join(fdat, by=c("wbic"="WBIC","year"="Survey.Year"))%>%
+  mutate(exp.rate=markHarvEstimate/nFN.marked)
+
+# Throwing out NA u's and those >1 (NAs from lack of walleye harvest per strata or missing FN marks, >1's is 6 observations where # marks in creel exceeds # marks at large)
+ang.exp.nw=ang.exp.nw[!is.na(ang.exp.nw$exp.rate) & ang.exp.nw$exp.rate<1.0,]
+# creating survey-level effort estimates
+ang.exp.nw=ang.exp.nw%>%
+  group_by(survey.seq.no)%>%
+  summarise(meanU=mean(exp.rate,na.rm = T),
+            exp.rate.sd=sd(exp.rate,na.rm = T))
+
+###### MAY-AUG ####
+
+eff.ma=ceff.ct%>%
+  filter(month%in%c(5:8))%>%
+  left_join(lchar[,c(1,15)])%>%
+  mutate(annual.eff.hectare=total.effort/(lake.area/2.47))
+
+ifish.ma=ifish%>%
+  filter(month%in%c(5:8))%>%
+  group_by(wbic, year,survey.seq.no,survey.begin.date,survey.end.date, mark.found,month,daytype)%>%
+  summarise(nfish=sum(fish.count)) # number of fish of each mark typed returned in that creel
+
+ifish.ma=ifish.ma%>% # now throwing out mark type and just taking overall number of marks recapped that month for that survey.
+  group_by(wbic, year, survey.seq.no, survey.begin.date, survey.end.date,month,daytype)%>%
+  summarise(n.marks.recapped=sum(nfish[!is.na(mark.found)]),
+            totalFishExamined=sum(nfish))
+
+# spp.harvest is the column that has the estimate of the harvest for that species in that strata
+harvestEstimates.ma=iharv%>%
+  filter(month%in%c(5:8))%>%
+  select(year,wbic,survey.seq.no, month, daytype,spp.harvest,harvest,total.harvest,total.spp.harvest)
+
+# combining harvest estimates with marked proportion estimate to get total number of marks harvested
+
+markHarvEst.ma=ifish.ma%>%
+  left_join(harvestEstimates.ma)%>%
+  mutate(markHarvEstimate=(n.marks.recapped/totalFishExamined)*spp.harvest)
+
+ang.exp.ma=markHarvEst.ma%>%
+  left_join(fdat, by=c("wbic"="WBIC","year"="Survey.Year"))%>%
+  mutate(exp.rate=markHarvEstimate/nFN.marked)
+
+# Throwing out NA u's and those >1 (NAs from lack of walleye harvest per strata or missing FN marks, >1's is 6 observations where # marks in creel exceeds # marks at large)
+ang.exp.ma=ang.exp.ma[!is.na(ang.exp.ma$exp.rate) & ang.exp.ma$exp.rate<1.0,]
+# creating survey-level effort estimates
+ang.exp.ma=ang.exp.ma%>%
+  group_by(survey.seq.no)%>%
+  summarise(meanU=mean(exp.rate,na.rm = T),
+            exp.rate.sd=sd(exp.rate,na.rm = T))
+
+# for each of these % reductions I'm removing data based on visit fish seq no to simulate what would happen if that creel clear visit to the lake were removed.
+###### 25% WEEKDAYS ####
+
+rm.fish.seq.no=NA
+rm.visit.fish.seq.no=NA
+ifish.surv=unique(ifish$survey.seq.no)
+
+set.seed(3)
+for(i in 1:length(ifish.surv)){ # survey loop
+  full=ifish[ifish$survey.seq.no==ifish.surv[i] & ifish$daytype=="weekday",]
+  ms=unique(full$month)
+  if(nrow(full)>0){
+    for(m in 1:length(ms)){ # month loop
+      visits=unique(full$visit.fish.seq.no[full$month==ms[m]])
+      visit.rm=visits[c(round(runif(round(0.25*length(visits)),min=1,max = length(visits))))]
+      t.rm=full$fish.data.seq.no[full$visit.fish.seq.no%in%visit.rm]# fish seq nos to remove that associated with the visit seq nos selected for removal
+      
+      rm.visit.fish.seq.no=c(rm.visit.fish.seq.no,visit.rm) # visit fish seq nos to use to reduce the interview, count, and fish data needed to get harvest estimates
+      rm.fish.seq.no=c(rm.fish.seq.no,t.rm) # vector of fish to remove from individual fish data
+      
+    }
+  }
+}
+
+ifish.25wd=ifish[!(ifish$fish.data.seq.no%in%rm.fish.seq.no),] # reduced individual fish data
+iint.25wd=cint%>%
+  filter(wbic%in%ctwiWBIC.creel & !(visit.fish.seq.no%in%rm.visit.fish.seq.no)) # reduced interview data
+icou.25wd=ccou%>%
+  filter(wbic%in%ctwiWBIC.creel & !(visit.fish.seq.no%in%rm.visit.fish.seq.no)) # reduced count data
+ifishAg.25wd=cfish%>%
+  filter(wbic%in%ctwiWBIC.creel & !(visit.fish.seq.no%in%rm.visit.fish.seq.no)) # reduced aggregate fish data
+
+iharv.25wd=calc_creel_harvest(creel_count_data = icou.25wd,
+                              creel_int_data = iint.25wd,
+                              creel_fish_data = ifishAg.25wd) # harvest estimates from the reduced data
+eff.25wd=calc_creel_effort(creel_count_data = icou.25wd, creel_int_data = iint.25wd)
+eff.25wd=eff.25wd%>%
+  left_join(lchar[,c(1,15)])%>%
+  mutate(annual.eff.hectare=total.effort/(lake.area/2.47))
+
+wd25=ifish.25wd%>%
+  group_by(wbic, year,survey.seq.no,survey.begin.date,survey.end.date, mark.found,month,daytype)%>%
+  summarise(nfish=sum(fish.count)) # number of fish of each mark typed returned in that creel
+
+wd25=wd25%>% # now throwing out mark type and just taking overall number of marks recapped that month for that survey.
+  group_by(wbic, year, survey.seq.no, survey.begin.date, survey.end.date,month,daytype)%>%
+  summarise(n.marks.recapped=sum(nfish[!is.na(mark.found)]),
+            totalFishExamined=sum(nfish))
+
+# spp.harvest is the column that has the estimate of the harvest for that species in that strata
+harvestEstimates.25wd=iharv.25wd%>%
+  filter(species.code=="X22")%>%
+  select(year,wbic,survey.seq.no, month, daytype,spp.harvest,harvest,total.harvest,total.spp.harvest)
+
+# combining harvest estimates with marked proportion estimate to get total number of marks harvested
+
+markHarvEst.25wd=wd25%>%
+  left_join(harvestEstimates.25wd)%>%
+  mutate(markHarvEstimate=(n.marks.recapped/totalFishExamined)*spp.harvest)
+
+ang.exp.25wd=markHarvEst.25wd%>%
+  left_join(fdat, by=c("wbic"="WBIC","year"="Survey.Year"))%>%
+  mutate(exp.rate=markHarvEstimate/nFN.marked)
+
+# Throwing out NA u's and those >1 (NAs from lack of walleye harvest per strata or missing FN marks, >1's is 6 observations where # marks in creel exceeds # marks at large)
+ang.exp.25wd=ang.exp.25wd[!is.na(ang.exp.25wd$exp.rate) & ang.exp.25wd$exp.rate<1.0,]
+# creating survey-level effort estimates
+ang.exp.25wd=ang.exp.25wd%>%
+  group_by(survey.seq.no)%>%
+  summarise(meanU=mean(exp.rate,na.rm = T),
+            exp.rate.sd=sd(exp.rate,na.rm = T))
+
+
+###### 50% WEEKDAYS ####
+
+rm.fish.seq.no=NA
+rm.visit.fish.seq.no=NA
+ifish.surv=unique(ifish$survey.seq.no)
+
+set.seed(3)
+for(i in 1:length(ifish.surv)){ # survey loop
+  full=ifish[ifish$survey.seq.no==ifish.surv[i] & ifish$daytype=="weekday",]
+  ms=unique(full$month)
+  if(nrow(full)>0){
+    for(m in 1:length(ms)){ # month loop
+      visits=unique(full$visit.fish.seq.no[full$month==ms[m]])
+      visit.rm=visits[c(round(runif(round(0.50*length(visits)),min=1,max = length(visits))))]
+      t.rm=full$fish.data.seq.no[full$visit.fish.seq.no%in%visit.rm]# fish seq nos to remove that associated with the visit seq nos selected for removal
+      
+      rm.visit.fish.seq.no=c(rm.visit.fish.seq.no,visit.rm) # visit fish seq nos to use to reduce the interview, count, and fish data needed to get harvest estimates
+      rm.fish.seq.no=c(rm.fish.seq.no,t.rm) # vector of fish to remove from individual fish data
+      
+    }
+  }
+}
+
+ifish.50wd=ifish[!(ifish$fish.data.seq.no%in%rm.fish.seq.no),] # reduced individual fish data
+iint.50wd=cint%>%
+  filter(wbic%in%ctwiWBIC.creel & !(visit.fish.seq.no%in%rm.visit.fish.seq.no)) # reduced interview data
+icou.50wd=ccou%>%
+  filter(wbic%in%ctwiWBIC.creel & !(visit.fish.seq.no%in%rm.visit.fish.seq.no)) # reduced count data
+ifishAg.50wd=cfish%>%
+  filter(wbic%in%ctwiWBIC.creel & !(visit.fish.seq.no%in%rm.visit.fish.seq.no)) # reduced aggregate fish data
+
+iharv.50wd=calc_creel_harvest(creel_count_data = icou.50wd,
+                              creel_int_data = iint.50wd,
+                              creel_fish_data = ifishAg.50wd) # harvest estimates from the reduced data
+eff.50wd=calc_creel_effort(creel_count_data = icou.50wd, creel_int_data = iint.50wd)
+eff.50wd=eff.50wd%>%
+  left_join(lchar[,c(1,15)])%>%
+  mutate(annual.eff.hectare=total.effort/(lake.area/2.47))
+
+wd50=ifish.50wd%>%
+  group_by(wbic, year,survey.seq.no,survey.begin.date,survey.end.date, mark.found,month,daytype)%>%
+  summarise(nfish=sum(fish.count)) # number of fish of each mark typed returned in that creel
+
+wd50=wd50%>% # now throwing out mark type and just taking overall number of marks recapped that month for that survey.
+  group_by(wbic, year, survey.seq.no, survey.begin.date, survey.end.date,month,daytype)%>%
+  summarise(n.marks.recapped=sum(nfish[!is.na(mark.found)]),
+            totalFishExamined=sum(nfish))
+
+# spp.harvest is the column that has the estimate of the harvest for that species in that strata
+harvestEstimates.50wd=iharv.50wd%>%
+  filter(species.code=="X22")%>%
+  select(year,wbic,survey.seq.no, month, daytype,spp.harvest,harvest,total.harvest,total.spp.harvest)
+
+# combining harvest estimates with marked proportion estimate to get total number of marks harvested
+
+markHarvEst.50wd=wd50%>%
+  left_join(harvestEstimates.50wd)%>%
+  mutate(markHarvEstimate=(n.marks.recapped/totalFishExamined)*spp.harvest)
+
+ang.exp.50wd=markHarvEst.50wd%>%
+  left_join(fdat, by=c("wbic"="WBIC","year"="Survey.Year"))%>%
+  mutate(exp.rate=markHarvEstimate/nFN.marked)
+
+# Throwing out NA u's and those >1 (NAs from lack of walleye harvest per strata or missing FN marks, >1's is 6 observations where # marks in creel exceeds # marks at large)
+ang.exp.50wd=ang.exp.50wd[!is.na(ang.exp.50wd$exp.rate) & ang.exp.50wd$exp.rate<1.0,]
+
+# creating survey-level effort estimates
+ang.exp.50wd=ang.exp.50wd%>%
+  group_by(survey.seq.no)%>%
+  summarise(meanU=mean(exp.rate,na.rm = T),
+            exp.rate.sd=sd(exp.rate,na.rm = T))
+
+###### 50% WEEKENDS ####
+
+rm.fish.seq.no=NA
+rm.visit.fish.seq.no=NA
+ifish.surv=unique(ifish$survey.seq.no)
+
+set.seed(3)
+for(i in 1:length(ifish.surv)){ # survey loop
+  full=ifish[ifish$survey.seq.no==ifish.surv[i] & ifish$daytype=="weekend",]
+  ms=unique(full$month)
+  if(nrow(full)>0){
+    for(m in 1:length(ms)){ # month loop
+      visits=unique(full$visit.fish.seq.no[full$month==ms[m]])
+      visit.rm=visits[c(round(runif(round(0.50*length(visits)),min=1,max = length(visits))))]
+      t.rm=full$fish.data.seq.no[full$visit.fish.seq.no%in%visit.rm]# fish seq nos to remove that associated with the visit seq nos selected for removal
+      
+      rm.visit.fish.seq.no=c(rm.visit.fish.seq.no,visit.rm) # visit fish seq nos to use to reduce the interview, count, and fish data needed to get harvest estimates
+      rm.fish.seq.no=c(rm.fish.seq.no,t.rm) # vector of fish to remove from individual fish data
+      
+    }
+  }
+}
+
+ifish.50we=ifish[!(ifish$fish.data.seq.no%in%rm.fish.seq.no),] # reduced individual fish data
+iint.50we=cint%>%
+  filter(wbic%in%ctwiWBIC.creel & !(visit.fish.seq.no%in%rm.visit.fish.seq.no)) # reduced interview data
+icou.50we=ccou%>%
+  filter(wbic%in%ctwiWBIC.creel & !(visit.fish.seq.no%in%rm.visit.fish.seq.no)) # reduced count data
+ifishAg.50we=cfish%>%
+  filter(wbic%in%ctwiWBIC.creel & !(visit.fish.seq.no%in%rm.visit.fish.seq.no)) # reduced aggregate fish data
+
+iharv.50we=calc_creel_harvest(creel_count_data = icou.50we,
+                              creel_int_data = iint.50we,
+                              creel_fish_data = ifishAg.50we) # harvest estimates from the reduced data
+eff.50we=calc_creel_effort(creel_count_data = icou.50we, creel_int_data = iint.50we)
+eff.50we=eff.50we%>%
+  left_join(lchar[,c(1,15)])%>%
+  mutate(annual.eff.hectare=total.effort/(lake.area/2.47))
+
+we50=ifish.50we%>%
+  group_by(wbic, year,survey.seq.no,survey.begin.date,survey.end.date, mark.found,month,daytype)%>%
+  summarise(nfish=sum(fish.count)) # number of fish of each mark typed returned in that creel
+
+we50=we50%>% # now throwing out mark type and just taking overall number of marks recapped that month for that survey.
+  group_by(wbic, year, survey.seq.no, survey.begin.date, survey.end.date,month,daytype)%>%
+  summarise(n.marks.recapped=sum(nfish[!is.na(mark.found)]),
+            totalFishExamined=sum(nfish))
+
+# spp.harvest is the column that has the estimate of the harvest for that species in that strata
+harvestEstimates.50we=iharv.50we%>%
+  filter(species.code=="X22")%>%
+  select(year,wbic,survey.seq.no, month, daytype,spp.harvest,harvest,total.harvest,total.spp.harvest)
+
+
+# combining harvest estimates with marked proportion estimate to get total number of marks harvested
+
+markHarvEst.50we=we50%>%
+  left_join(harvestEstimates.50we)%>%
+  mutate(markHarvEstimate=(n.marks.recapped/totalFishExamined)*spp.harvest)
+
+ang.exp.50we=markHarvEst.50we%>%
+  left_join(fdat, by=c("wbic"="WBIC","year"="Survey.Year"))%>%
+  mutate(exp.rate=markHarvEstimate/nFN.marked)
+
+# Throwing out NA u's and those >1 (NAs from lack of walleye harvest per strata or missing FN marks, >1's is 6 observations where # marks in creel exceeds # marks at large)
+ang.exp.50we=ang.exp.50we[!is.na(ang.exp.50we$exp.rate) & ang.exp.50we$exp.rate<1.0,]
+
+# creating survey-level effort estimates
+ang.exp.50we=ang.exp.50we%>%
+  group_by(survey.seq.no)%>%
+  summarise(meanU=mean(exp.rate,na.rm = T),
+            exp.rate.sd=sd(exp.rate,na.rm = T))
+
+```
+
+
+
+```{r monthlyEff,fig.width=8,fig.cap="Distribution of effort estimates by month (panel a) for all years of CTWI creel data. Horizontal line is overall mean effort. Black points are outliers. Panel B is the same information presented on a log-scale. "}
+
+
+# plot of effort by month
+ceff.ct$plot.month=month(ceff.ct$month,label = T)
+p1=ggplot(ceff.ct)+theme_classic()+
+  geom_boxplot(aes(y=annual.eff.hectare, x=plot.month), fill="grey")+
+  geom_hline(yintercept = mean(ceff.ct$annual.eff.hectare, na.rm = T), color="black")+
+  labs(y=" Annual Effort per Hectare", x="Month")
+
+# plot of effort by month - logged
+p2=ggplot(ceff.ct)+theme_classic()+
+  geom_boxplot(aes(y=log(annual.eff.hectare), x=plot.month), fill="grey")+
+  geom_hline(yintercept = log(mean(ceff.ct$annual.eff.hectare)), color="black")+ # setting this manually since the 0 exp rates mess up the logging here
+  labs(y="Log(Annual Effort per Hectare)", x="Month")
+
+ggarrange(p1,p2,nrow = 1,ncol=2,labels = 'auto')
+```
+
+```{r uRatePlot, fig.cap="Distribution, on a log scale, of effort for the full data set plus 5 scenarios with reduced data. Actual = full data set, mayAug = May to August creel data only, noWinter = winter creel data removed, wd25 = 25% of weekday creel visits per month removed, wd50 = 50% of weekday creel visits per month removed, we50 = 50% of weekend creel visits per month removed."}
+
+# creating survey-level effort for the actual data
+eff.surv.a=ceff.ct%>%
+  group_by(survey.seq.no)%>%
+  summarise(total.eff=sum(annual.eff.hectare,na.rm = T))
+eff.surv.nw=eff.nw%>%
+  group_by(survey.seq.no)%>%
+  summarise(total.eff=sum(annual.eff.hectare,na.rm = T))
+eff.surv.ma=eff.ma%>%
+  group_by(survey.seq.no)%>%
+  summarise(total.eff=sum(annual.eff.hectare,na.rm = T))
+eff.surv.25wd=eff.25wd%>%
+  group_by(survey.seq.no)%>%
+  summarise(total.eff=sum(annual.eff.hectare,na.rm = T))
+eff.surv.50wd=eff.50wd%>%
+  group_by(survey.seq.no)%>%
+  summarise(total.eff=sum(annual.eff.hectare,na.rm = T))
+eff.surv.50we=eff.50we%>%
+  group_by(survey.seq.no)%>%
+  summarise(total.eff=sum(annual.eff.hectare,na.rm = T))
+# combining actual and reduced dataframes into one big one for plotting
+
+ttrExp=rbind(cbind(eff.surv.a,treat=rep("actual",nrow(eff.surv.a))),
+             cbind(eff.surv.nw, treat=rep("noWinter",nrow(eff.surv.nw))),
+             cbind(eff.surv.ma, treat=rep("mayAug",nrow(eff.surv.ma))),
+             cbind(eff.surv.25wd, treat=rep("wd25",nrow(eff.surv.25wd))),
+             cbind(eff.surv.50wd, treat=rep("wd50",nrow(eff.surv.50wd))),
+             cbind(eff.surv.50we, treat=rep("we50",nrow(eff.surv.50we))))
+
+ggplot(ttrExp)+theme_classic()+
+  geom_density(aes(x=log(total.eff), fill=treat),alpha=0.2)+
+  labs(x="Log(Annual Effort per Hectare)", y="Density", fill="Scenario")
+```
+
+### Bayesian Model Fitting
+
+Individual likelihoods were constructed for each reduced data set and fit using the functions in the `BayesianTools` package in `R`.
+These model fits were checked for convergence using visual inspection of trace plots, posterior distributions, and Gelman-Rubin Diagnostic tests to ensure that models had converged.
+All models were fit using Differential Evolution Markov-Chain-Monte-Carlo algorithms run for 10,000 iterations with the first 5,000 discarded as burn-in.
+
+```{r eff-bt-model-fits, echo=T}
+# one likelihood to estimate parms for using the 6 different treatments
+# creating data frame to model with effort estimates
+
+#removing 0s since they can't be logged and if I were to make them a small number they would throw off the data and make it bimodal which would probably mean switching to a gamma distribution to model the data. There are 8 0's accounting for 1% of the data. I'm going to operate under the assumption that if a survey gives a 0 effort estimate with the full survey, then efs collecting less data isn't going to change that number. 
+zeros.actual=sum(ttrExp$total.eff[ttrExp$treat=="actual"]==0)
+zeros.nw=sum(ttrExp$total.eff[ttrExp$treat=="noWinter"]==0)
+zeros.ma=sum(ttrExp$total.eff[ttrExp$treat=="mayAug"]==0)
+zeros.wd25=sum(ttrExp$total.eff[ttrExp$treat=="wd25"]==0)
+zeros.wd50=sum(ttrExp$total.eff[ttrExp$treat=="wd50"]==0)
+zeros.we50=sum(ttrExp$total.eff[ttrExp$treat=="we50"]==0)
+
+Ztab=data.frame(Scenario=c("Actual","No Winter","May-August","25% Weekday Reduction","50% Weekday Reduction","50% Weekend Reduction"),
+                Zeros=c(zeros.actual,zeros.nw,zeros.ma,zeros.wd25,zeros.wd50,zeros.we50))
+kable(Ztab,
+      format='latex',
+      caption="Table of the number of surveys with effort estimates equal to 0 for each data scenario.")
+
+# removing 0s here as described in the text.
+modDat=ttrExp[ttrExp$total.eff!=0,]
+
+#### ACTUAL ####
+effLL.a=function(param){
+  alpha=param[1]
+  beta=param[2]
+
+  efs=rlnorm(nrow(modDat[modDat$treat=="actual",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(modDat$total.eff[modDat$treat=="actual"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+
+prior=createTruncatedNormalPrior(mean=c(mean(log(modDat$total.eff[modDat$treat=="actual"])),sd(log(modDat$total.eff[modDat$treat=="actual"]))),
+                                 sd=c(1,1),
+                                 lower = c(-15,0),
+                                 upper = c(15,5))
+
+setup.actual=createBayesianSetup(effLL.a, prior = prior)
+
+settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+set.seed(10)
+eff.actual=runMCMC(bayesianSetup = setup.actual, sampler = "DEzs", settings = settings) # takes about 10 seconds
+
+#### NW ####
+effLL.nw=function(param){
+  alpha=param[1]
+  beta=param[2]
+  
+  efs=rlnorm(nrow(modDat[modDat$treat=="noWinter",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(modDat$total.eff[modDat$treat=="noWinter"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+
+prior=createTruncatedNormalPrior(mean=c(mean(log(modDat$total.eff[modDat$treat=="noWinter"])),sd(log(modDat$total.eff[modDat$treat=="noWinter"]))), 
+                                 sd=c(1,1),
+                                 lower = c(-15,0),
+                                 upper = c(15,5))
+
+setup.nw=createBayesianSetup(effLL.nw, prior = prior)
+
+settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+set.seed(10)
+eff.nw=runMCMC(bayesianSetup = setup.nw, sampler = "DEzs", settings = settings)
+
+#### MA ####
+
+effLL.ma=function(param){
+  alpha=param[1]
+  beta=param[2]
+  
+  efs=rlnorm(nrow(modDat[modDat$treat=="mayAug",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(modDat$total.eff[modDat$treat=="mayAug"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+
+prior=createTruncatedNormalPrior(mean=c(mean(log(modDat$total.eff[modDat$treat=="mayAug"])),sd(log(modDat$total.eff[modDat$treat=="mayAug"]))), 
+                                 sd=c(1,1),
+                                 lower = c(-15,0),
+                                 upper = c(15,5))
+
+setup.ma=createBayesianSetup(effLL.ma, prior = prior)
+
+settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+set.seed(10)
+eff.ma=runMCMC(bayesianSetup = setup.ma, sampler = "DEzs", settings = settings)
+
+#### WD25 ####
+
+effLL.wd25=function(param){
+  alpha=param[1]
+  beta=param[2]
+  
+  efs=rlnorm(nrow(modDat[modDat$treat=="wd25",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(modDat$total.eff[modDat$treat=="wd25"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+
+prior=createTruncatedNormalPrior(mean=c(mean(log(modDat$total.eff[modDat$treat=="wd25"])),sd(log(modDat$total.eff[modDat$treat=="wd25"]))), 
+                                 sd=c(1,1),
+                                 lower = c(-15,0),
+                                 upper = c(15,5))
+
+setup.wd25=createBayesianSetup(effLL.wd25, prior = prior)
+
+settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+set.seed(10)
+eff.25wd=runMCMC(bayesianSetup = setup.wd25, sampler = "DEzs", settings = settings)
+
+#### WD50 ####
+effLL.wd50=function(param){
+  alpha=param[1]
+  beta=param[2]
+  
+  efs=rlnorm(nrow(modDat[modDat$treat=="wd50",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(modDat$total.eff[modDat$treat=="wd50"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+
+prior=createTruncatedNormalPrior(mean=c(mean(log(modDat$total.eff[modDat$treat=="wd50"])),sd(log(modDat$total.eff[modDat$treat=="wd50"]))), 
+                                 sd=c(1,1),
+                                 lower = c(-15,0),
+                                 upper = c(15,5))
+
+setup.wd50=createBayesianSetup(effLL.wd50, prior = prior)
+
+settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+set.seed(10)
+eff.50wd=runMCMC(bayesianSetup = setup.wd50, sampler = "DEzs", settings = settings)
+
+#### WE50 ####
+effLL.we50=function(param){
+  alpha=param[1]
+  beta=param[2]
+  
+  efs=rlnorm(nrow(modDat[modDat$treat=="we50",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(modDat$total.eff[modDat$treat=="we50"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+
+prior=createTruncatedNormalPrior(mean=c(mean(log(modDat$total.eff[modDat$treat=="we50"])),sd(log(modDat$total.eff[modDat$treat=="we50"]))), 
+                                 sd=c(1,1),
+                                 lower = c(-15,0),
+                                 upper = c(15,5))
+
+setup.we50=createBayesianSetup(effLL.we50, prior = prior)
+
+settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+set.seed(10)
+eff.50we=runMCMC(bayesianSetup = setup.we50, sampler = "DEzs", settings = settings)
+
+```
+
+### Model Checking
+
+
+```{r effDataReproduction, fig.width=8, fig.height=6 ,fig.cap="Distributions of the observed and model predicted data for each scenario. Model predicted data comes from lognormal distribution paramterized using the median parameter estimate of the model posterior."}
+
+# looking to see if parm estimates produce data that visually at least looks like the observed data for that scenario
+pars.a=getSample(eff.actual)
+pars.nw=getSample(eff.nw)
+pars.ma=getSample(eff.ma)
+pars.wd25=getSample(eff.25wd)
+pars.wd50=getSample(eff.50wd)
+pars.we50=getSample(eff.50we)
+
+set.seed(3)
+aComp=data.frame(eff.hectare=c(modDat$total.eff[modDat$treat=="actual"],rlnorm(n=length(modDat$total.eff[modDat$treat=="actual"]),
+                                                                         meanlog = median(pars.a[,1]),
+                                                                         sdlog = median(pars.a[,2]))),
+                    treat=c(rep("observed",length(modDat$total.eff[modDat$treat=="actual"])),rep("pred",length(modDat$total.eff[modDat$treat=="actual"]))))
+set.seed(3)
+nwComp=data.frame(eff.hectare=c(modDat$total.eff[modDat$treat=="noWinter"],rlnorm(n=length(modDat$total.eff[modDat$treat=="noWinter"]),
+                                                                    meanlog = median(pars.nw[,1]),
+                                                                    sdlog = median(pars.nw[,2]))),
+                 treat=c(rep("observed",length(modDat$total.eff[modDat$treat=="noWinter"])),rep("pred",length(modDat$total.eff[modDat$treat=="noWinter"]))))
+set.seed(3)
+maComp=data.frame(eff.hectare=c(modDat$total.eff[modDat$treat=="mayAug"],rlnorm(n=length(modDat$total.eff[modDat$treat=="mayAug"]),
+                                                                    meanlog = median(pars.ma[,1]),
+                                                                    sdlog = median(pars.ma[,2]))),
+                 treat=c(rep("observed",length(modDat$total.eff[modDat$treat=="mayAug"])),rep("pred",length(modDat$total.eff[modDat$treat=="mayAug"]))))
+set.seed(3)
+wd25Comp=data.frame(eff.hectare=c(modDat$total.eff[modDat$treat=="wd25"],rlnorm(n=length(modDat$total.eff[modDat$treat=="wd25"]),
+                                                                    meanlog = median(pars.wd25[,1]),
+                                                                    sdlog = median(pars.wd25[,2]))),
+                 treat=c(rep("observed",length(modDat$total.eff[modDat$treat=="wd25"])),rep("pred",length(modDat$total.eff[modDat$treat=="wd25"]))))
+set.seed(3)
+wd50Comp=data.frame(eff.hectare=c(modDat$total.eff[modDat$treat=="wd50"],rlnorm(n=length(modDat$total.eff[modDat$treat=="wd50"]),
+                                                                    meanlog = median(pars.wd50[,1]),
+                                                                    sdlog = median(pars.wd50[,2]))),
+                 treat=c(rep("observed",length(modDat$total.eff[modDat$treat=="wd50"])),rep("pred",length(modDat$total.eff[modDat$treat=="wd50"]))))
+set.seed(3)
+we50Comp=data.frame(eff.hectare=c(modDat$total.eff[modDat$treat=="we50"],rlnorm(n=length(modDat$total.eff[modDat$treat=="we50"]),
+                                                                    meanlog = median(pars.we50[,1]),
+                                                                    sdlog = median(pars.we50[,2]))),
+                 treat=c(rep("observed",length(modDat$total.eff[modDat$treat=="we50"])),rep("pred",length(modDat$total.eff[modDat$treat=="we50"]))))
+
+a.p=ggplot(aComp)+theme_classic()+
+  geom_density(aes(x=log(eff.hectare),fill=treat),alpha=0.2)+
+  scale_fill_viridis_d()+labs(x="Log(Annual Effort per Hectare)", y="Density", title = "Actual", fill=element_blank())
+nw.p=ggplot(nwComp)+theme_classic()+
+  geom_density(aes(x=log(eff.hectare),fill=treat),alpha=0.2)+
+  scale_fill_viridis_d()+labs(x="Log(Annual Effort per Hectare)", y="Density", title = "No Winter Data \n(April - October)", fill=element_blank())
+ma.p=ggplot(maComp)+theme_classic()+
+  geom_density(aes(x=log(eff.hectare),fill=treat),alpha=0.2)+
+  scale_fill_viridis_d()+labs(x="Log(Annual Effort per Hectare)", y="Density", title = "May - August \nData Only", fill=element_blank())
+wd25.p=ggplot(wd25Comp)+theme_classic()+
+  geom_density(aes(x=log(eff.hectare),fill=treat),alpha=0.2)+
+  scale_fill_viridis_d()+labs(x="Log(Annual Effort per Hectare)", y="Density", title = "25% of Weekday \nCreel Visits/Month \nRemoved", fill=element_blank())
+wd50.p=ggplot(wd25Comp)+theme_classic()+
+  geom_density(aes(x=log(eff.hectare),fill=treat),alpha=0.2)+
+  scale_fill_viridis_d()+labs(x="Log(Annual Effort per Hectare)", y="Density", title = "50% of Weekday \nCreel Visits/Month \nRemoved", fill=element_blank())
+we50.p=ggplot(we50Comp)+theme_classic()+
+  geom_density(aes(x=log(eff.hectare),fill=treat),alpha=0.2)+
+  scale_fill_viridis_d()+labs(x="Log(Annual Effort per Hectare)", y="Density", title = "50% of Weekdend \nCreel Visits/Month \nRemoved", fill=element_blank())
+
+ggarrange(a.p,nw.p,ma.p,wd25.p,wd50.p,we50.p, common.legend = T)
+```
+
+```{r eff-gelman-rubin-diagnostics, echo=T, eval=FALSE}
+
+gelmanDiagnostics(eff.actual) # converged
+gelmanDiagnostics(eff.nw) # converged
+gelmanDiagnostics(eff.ma) # converged
+gelmanDiagnostics(eff.25wd) # converged
+gelmanDiagnostics(eff.50wd) # converged
+gelmanDiagnostics(eff.50we) # converged
+
+```
+
+```{r effbpValue}
+
+# dataframe to hold output
+bpValues=data.frame(scenario=c("Actual", "No Winter", "May-August","25% weeday removal","50% weekday removal","50% weekend removal"),
+                    sd.pval=NA)
+#### Pb ACTUAL ####
+pval.actual=data.frame(alpha=rep(NA,nrow(pars.a)),
+                       beta=NA,
+                       sd=NA)
+set.seed(10)
+for(i in 1:nrow(pars.a)){
+  tempdat=rlnorm(n=length(modDat$total.eff[modDat$treat=="actual"]),
+                 meanlog = pars.a[i,1],
+                 sdlog = pars.a[i,2])
+  pval.actual$alpha[i]=pars.a[i,1]
+  pval.actual$beta[i]=pars.a[i,2]
+  pval.actual$sd[i]=sd(log(tempdat))
+}
+
+# now calculate the number of times the sd exceeds that of the real data
+
+pval.actual$sdExceed=0
+
+actual.sd=sd(log(modDat$total.eff[modDat$treat=="actual"]))
+
+pval.actual$sdExceed[pval.actual$sd>actual.sd]=1
+
+bpValues$sd.pval[1]=sum(pval.actual$sdExceed==1)/nrow(pval.actual) # if this value is < 0.1 for >0.9 that would suggest model is not fitting well. 0.5 is ideal
+
+#### Pb NO WINTER ####
+pval.noWinter=data.frame(alpha=rep(NA,nrow(pars.nw)),
+                       beta=NA,
+                       sd=NA)
+set.seed(10)
+for(i in 1:nrow(pars.nw)){
+  tempdat=rlnorm(n=length(modDat$total.eff[modDat$treat=="noWinter"]),
+                 meanlog = pars.nw[i,1],
+                 sdlog = pars.nw[i,2])
+  pval.noWinter$alpha[i]=pars.nw[i,1]
+  pval.noWinter$beta[i]=pars.nw[i,2]
+  pval.noWinter$sd[i]=sd(log(tempdat))
+}
+
+# now calculate the number of times the sd exceeds that of the real data
+
+pval.noWinter$sdExceed=0
+
+noWinter.sd=sd(log(modDat$total.eff[modDat$treat=="noWinter"]))
+
+pval.noWinter$sdExceed[pval.noWinter$sd>noWinter.sd]=1
+
+bpValues$sd.pval[2]=sum(pval.noWinter$sdExceed==1)/nrow(pval.noWinter) # if this value is < 0.1 for >0.9 that would suggest model is not fitting well. 0.5 is ideal
+
+#### Pb MAYAUGUST ####
+pval.mayAug=data.frame(alpha=rep(NA,nrow(pars.ma)),
+                       beta=NA,
+                       sd=NA)
+set.seed(10)
+for(i in 1:nrow(pars.ma)){
+  tempdat=rlnorm(n=length(modDat$total.eff[modDat$treat=="mayAug"]),
+                 meanlog = pars.ma[i,1],
+                 sdlog = pars.ma[i,2])
+  pval.mayAug$alpha[i]=pars.ma[i,1]
+  pval.mayAug$beta[i]=pars.ma[i,2]
+  pval.mayAug$sd[i]=sd(log(tempdat))
+}
+
+# now calculate the number of times the sd exceeds that of the real data
+
+pval.mayAug$sdExceed=0
+
+mayAug.sd=sd(log(modDat$total.eff[modDat$treat=="mayAug"]))
+
+pval.mayAug$sdExceed[pval.mayAug$sd>mayAug.sd]=1
+
+bpValues$sd.pval[3]=sum(pval.mayAug$sdExceed==1)/nrow(pval.mayAug) # if this value is < 0.1 for >0.9 that would suggest model is not fitting well. 0.5 is ideal
+
+#### Pb WD25 ####
+pval.wd25=data.frame(alpha=rep(NA,nrow(pars.wd25)),
+                       beta=NA,
+                       sd=NA)
+set.seed(10)
+for(i in 1:nrow(pars.wd25)){
+  tempdat=rlnorm(n=length(modDat$total.eff[modDat$treat=="wd25"]),
+                 meanlog = pars.wd25[i,1],
+                 sdlog = pars.wd25[i,2])
+  pval.wd25$alpha[i]=pars.wd25[i,1]
+  pval.wd25$beta[i]=pars.wd25[i,2]
+  pval.wd25$sd[i]=sd(log(tempdat))
+}
+
+# now calculate the number of times the sd exceeds that of the real data
+
+pval.wd25$sdExceed=0
+
+wd25.sd=sd(log(modDat$total.eff[modDat$treat=="wd25"]))
+
+pval.wd25$sdExceed[pval.wd25$sd>wd25.sd]=1
+
+bpValues$sd.pval[4]=sum(pval.wd25$sdExceed==1)/nrow(pval.wd25) # if this value is < 0.1 for >0.9 that would suggest model is not fitting well. 0.5 is ideal
+
+#### Pb WD50 ####
+pval.wd50=data.frame(alpha=rep(NA,nrow(pars.wd50)),
+                       beta=NA,
+                       sd=NA)
+set.seed(10)
+for(i in 1:nrow(pars.wd50)){
+  tempdat=rlnorm(n=length(modDat$total.eff[modDat$treat=="wd50"]),
+                 meanlog = pars.wd50[i,1],
+                 sdlog = pars.wd50[i,2])
+  pval.wd50$alpha[i]=pars.wd50[i,1]
+  pval.wd50$beta[i]=pars.wd50[i,2]
+  pval.wd50$sd[i]=sd(log(tempdat))
+}
+
+# now calculate the number of times the sd exceeds that of the real data
+
+pval.wd50$sdExceed=0
+
+wd50.sd=sd(log(modDat$total.eff[modDat$treat=="wd50"]))
+
+pval.wd50$sdExceed[pval.wd50$sd>wd50.sd]=1
+
+bpValues$sd.pval[5]=sum(pval.wd50$sdExceed==1)/nrow(pval.wd50) # if this value is < 0.1 for >0.9 that would suggest model is not fitting well. 0.5 is ideal
+
+#### Pb WE50 ####
+pval.we50=data.frame(alpha=rep(NA,nrow(pars.we50)),
+                       beta=NA,
+                       sd=NA)
+set.seed(10)
+for(i in 1:nrow(pars.we50)){
+  tempdat=rlnorm(n=length(modDat$total.eff[modDat$treat=="we50"]),
+                 meanlog = pars.we50[i,1],
+                 sdlog = pars.we50[i,2])
+  pval.we50$alpha[i]=pars.we50[i,1]
+  pval.we50$beta[i]=pars.we50[i,2]
+  pval.we50$sd[i]=sd(log(tempdat))
+}
+
+# now calculate the number of times the sd exceeds that of the real data
+
+pval.we50$sdExceed=0
+
+we50.sd=sd(log(modDat$total.eff[modDat$treat=="we50"]))
+
+pval.we50$sdExceed[pval.we50$sd>we50.sd]=1
+
+bpValues$sd.pval[6]=sum(pval.we50$sdExceed==1)/nrow(pval.we50) # if this value is < 0.1 for >0.9 that would suggest model is not fitting well. 0.5 is ideal
+
+kable(bpValues, digits = 3, col.names = c("Scenario","SD p-value"), align="lcc",caption = "Bayesian p-values for a lognormal distributed model. Each p-value describes whether or not there is a significant difference between data generated by the fitted model and the actual data for that scenario. Two metrics is standard devidation (SD).")
+```
+
+### Inference
+
+Having established that the models are fitting the data well, some inference can be gained as to whether or not the reductions in creel effort proposed here would result in a meaningful change in the total annual effort per acre estimated from the reduced data.
+
+```{r effDataComparisonToActual, fig.width=8,fig.height=6,fig.cap="Comparison of the distribution of actual annual effer per hectare estimates calculated from creel data and annual effort per hectare estimated calculated from simulated creel data for each data reduction scenario and the resulting median parameter values for their respective model fits."}
+
+aComp=data.frame(eff.hectare=c(modDat$total.eff[modDat$treat=="actual"],rlnorm(n=length(modDat$total.eff[modDat$treat=="actual"]),
+                                                                    meanlog = median(pars.a[,1]),
+                                                                    sdlog = median(pars.a[,2]))),
+                 treat=c(rep("actual",length(modDat$total.eff[modDat$treat=="actual"])),rep("model",length(modDat$total.eff[modDat$treat=="actual"]))))
+
+nwComp=data.frame(eff.hectare=c(modDat$total.eff[modDat$treat=="actual"],rlnorm(n=length(modDat$total.eff[modDat$treat=="actual"]),
+                                                                       meanlog = median(pars.nw[,1]),
+                                                                       sdlog = median(pars.nw[,2]))),
+                  treat=c(rep("actual",length(modDat$total.eff[modDat$treat=="actual"])),rep("model",length(modDat$total.eff[modDat$treat=="actual"]))))
+
+maComp=data.frame(eff.hectare=c(modDat$total.eff[modDat$treat=="actual"],rlnorm(n=length(modDat$total.eff[modDat$treat=="actual"]),
+                                                                     meanlog = median(pars.ma[,1]),
+                                                                     sdlog = median(pars.ma[,2]))),
+                  treat=c(rep("actual",length(modDat$total.eff[modDat$treat=="actual"])),rep("model",length(modDat$total.eff[modDat$treat=="actual"]))))
+
+wd25Comp=data.frame(eff.hectare=c(modDat$total.eff[modDat$treat=="actual"],rlnorm(n=length(modDat$total.eff[modDat$treat=="actual"]),
+                                                                     meanlog = median(pars.wd25[,1]),
+                                                                     sdlog = median(pars.wd25[,2]))),
+                    treat=c(rep("actual",length(modDat$total.eff[modDat$treat=="actual"])),rep("model",length(modDat$total.eff[modDat$treat=="actual"]))))
+
+wd50Comp=data.frame(eff.hectare=c(modDat$total.eff[modDat$treat=="actual"],rlnorm(n=length(modDat$total.eff[modDat$treat=="actual"]),
+                                                                     meanlog = median(pars.wd50[,1]),
+                                                                     sdlog = median(pars.wd50[,2]))),
+                    treat=c(rep("actual",length(modDat$total.eff[modDat$treat=="actual"])),rep("model",length(modDat$total.eff[modDat$treat=="actual"]))))
+
+we50Comp=data.frame(eff.hectare=c(modDat$total.eff[modDat$treat=="actual"],rlnorm(n=length(modDat$total.eff[modDat$treat=="actual"]),
+                                                                     meanlog = median(pars.we50[,1]),
+                                                                     sdlog = median(pars.we50[,2]))),
+                    treat=c(rep("actual",length(modDat$total.eff[modDat$treat=="actual"])),rep("model",length(modDat$total.eff[modDat$treat=="actual"]))))
+
+a.p=ggplot(aComp)+theme_classic()+
+  geom_density(aes(x=log(eff.hectare),fill=treat),alpha=0.2)+
+  scale_fill_viridis_d()+labs(x="Log(Annual Effort per Hectare)", y="Density", title = "Actual", fill=element_blank())
+nw.p=ggplot(nwComp)+theme_classic()+
+  geom_density(aes(x=log(eff.hectare),fill=treat),alpha=0.2)+
+  scale_fill_viridis_d()+labs(x="Log(Annual Effort per Hectare)", y="Density", title = "No Winter Data \n(April - October)", fill=element_blank())
+ma.p=ggplot(maComp)+theme_classic()+
+  geom_density(aes(x=log(eff.hectare),fill=treat),alpha=0.2)+
+  scale_fill_viridis_d()+labs(x="Log(Annual Effort per Hectare)", y="Density", title = "May - August \nData Only", fill=element_blank())
+wd25.p=ggplot(wd25Comp)+theme_classic()+
+  geom_density(aes(x=log(eff.hectare),fill=treat),alpha=0.2)+
+  scale_fill_viridis_d()+labs(x="Log(Annual Effort per Hectare)", y="Density", title = "25% of Weekday \nCreel Visits/Month \nRemoved", fill=element_blank())
+wd50.p=ggplot(wd25Comp)+theme_classic()+
+  geom_density(aes(x=log(eff.hectare),fill=treat),alpha=0.2)+
+  scale_fill_viridis_d()+labs(x="Log(Annual Effort per Hectare)", y="Density", title = "50% of Weekday \nCreel Visits/Month \nRemoved", fill=element_blank())
+we50.p=ggplot(we50Comp)+theme_classic()+
+  geom_density(aes(x=log(eff.hectare),fill=treat),alpha=0.2)+
+  scale_fill_viridis_d()+labs(x="Log(Annual Effort per Hectare)", y="Density", title = "50% of Weekdend \nCreel Visits/Month \nRemoved", fill=element_blank())
+
+ggarrange(a.p,nw.p,ma.p,wd25.p,wd50.p,we50.p, common.legend = T)
+```
+
+A Bayesian p-value can be employed here too.
+A test between the sd of the actual data and the sd of the reduced data can describe whether the model of the reduced data is able to approximate the actual data or not.
+Successful approximations are p-values close to 0.5 with reduced fit as values increase or decrease beyond 0.5.
+Generally, the rule of thumb is that p-values $<0.10$ or $>0.90$ signal unacceptable fits.
+However, these cutoffs can be set based on the objectives of the study at hand and the values of the decision makers.
+
+```{r bpValueComparison, warning=F, message=F}
+## p-value tests comparing the scenarios to actual to show that some scenarios approximate the actual quite well.
+
+bpval.comp=data.frame(scenario=c("Actual", "No Winter", "May-August","25% weeday removal","50% weekday removal","50% weekend removal"),
+                      sd.pval=NA)
+pval.actual$sdComp=0
+pval.actual$sdComp[pval.actual$sd>actual.sd]=1
+
+pval.noWinter$sdComp=0
+pval.noWinter$sdComp[pval.noWinter$sd>actual.sd]=1
+
+pval.mayAug$sdComp=0
+pval.mayAug$sdComp[pval.mayAug$sd>actual.sd]=1
+
+pval.wd25$sdComp=0
+pval.wd25$sdComp[pval.wd25$sd>actual.sd]=1
+
+pval.wd50$sdComp=0
+pval.wd50$sdComp[pval.wd50$sd>actual.sd]=1
+
+pval.we50$sdComp=0
+pval.we50$sdComp[pval.we50$sd>actual.sd]=1
+
+bpval.comp$sd.pval=c(sum(pval.actual$sdComp)/nrow(pval.actual),
+                           sum(pval.noWinter$sdComp)/nrow(pval.noWinter),
+                           sum(pval.mayAug$sdComp)/nrow(pval.mayAug),
+                           sum(pval.wd25$sdComp)/nrow(pval.wd25),
+                           sum(pval.wd50$sdComp)/nrow(pval.wd50),
+                           sum(pval.we50$sdComp)/nrow(pval.we50))
+
+kable(bpval.comp, digits = 3, col.names = c("Scenario", "SD p-value"), align="lcc",caption = "Bayesian p-values for the comparison between the actual data and the scenario-specific model fit to a lognormal distribution. This test is asking whether the scenario-specific model can approximate the actual data. When true this signals no effect of the data reduction for that scenario on the resulting annual effort per hectare estimate. Standard devidation (SD) was used as the variance metric here.")
+```
+
+### Year Specific Analyses
+
+Instead of modeling the full population of annual effort estimates as was done above, here I have done the model fitting on individual creel-years so that I can see how the removal of data for a creel-year (which is a comparatively large amount of missing data since only 16-20 lakes are creeled each year) impacts the annual effort per acre estimated that year.
+This analysis will follow the same routine as the whole-population analyses above but only consider one creel-year at a time.
+
+```{r yearAnalysisExampleLakes, fig.width=8,fig.cap="Comparison of the annual effort per hectare estimated from the reduced data for a handful of creel surveys. Most data reductions do not result in annual effort per hectare estimates that are much different from the actual data (most are within 1 SD of the effort estimate for that treatment). Colors represent data reduction scenarios, points are mean annual effort per hectare estimates across all months of that creel survey and vertical lines represent 1 standard deviation."}
+ttrExp=ttrExp%>%
+  left_join(cserv[,2:5])%>%
+  left_join(lchar[,c(1,3,15)])
+
+pdat=ttrExp[ttrExp$year%in%c(2015,2019,2022),]
+ggplot(pdat)+theme_classic()+
+  geom_pointrange(aes(x=paste(year,waterbody.name,sep = "_"), 
+                      y=total.eff, ymin=total.eff-sd(total.eff), 
+                      ymax=total.eff+sd(total.eff), color=treat), 
+                  position = position_dodge(width = 1))+
+  theme(axis.text.x = element_text(angle=45,hjust=1), legend.position = c(.75,.75))+
+  labs(x="Lake-Year",y="Annual Effort per Hectare (+/- 1 SD)",color="Scenario")+
+  scale_color_viridis_d()
+
+```
+
+```{r year-analysis-diff-actual, fig.cap="Boxplot of the difference between the actual annual effort per hectare estimate and the data-reduced annual effort per hectare estimate for each creel survey in the creel dataset. Most of the data exhibits differences very near 0 except the seasonal reductions, dots represent outliers (x<|> x's percentile-1.5*interquartile range)"}
+
+# metrics comparing differences in individual lake estimates
+
+trLake=ttrExp
+trLake$a.diff=NA
+trLake$a.exceed=NA
+
+for(i in 1:nrow(trLake)){
+  trLake$a.diff[i]=trLake$total.eff[trLake$treat=="actual" & trLake$survey.seq.no==trLake$survey.seq.no[i]]-trLake$total.eff[i]
+  trLake$a.exceed[i]=trLake$a.diff[i]>=sd(trLake$total.eff[trLake$treat=="actual"])
+}
+
+ggplot(trLake)+theme_classic()+
+   geom_boxplot(aes(y=a.diff, x=treat))+
+  labs(x="Data Reduction Scenario",y="Difference from actual")
+```
+
+```{r year-analysis-exceedenceTable, eval=F}
+
+exceedSummary=trLake%>%
+  group_by(treat)%>%
+  summarise(nTrue=sum(a.exceed,na.rm = T),
+            nFalse=sum(a.exceed==F,na.rm = T),
+            nNA=sum(is.na(a.exceed)))
+kable(exceedSummary,
+      col.names = c("Data Reduction Scenario","effort estimates exceeding actual","effort estimates not exceeding actual","NAs"),
+      caption = "Counts of the number of times the annual effort per hectare estimate for the reduced data scenario differs from the actual annual effort per hectare estimate for that treatment by more than 1 standard deviation. NAs ocurred where there was no variance in the effort estimate and thus no standard deviation could be calculated for the actual data.")
+
+```
+
+```{r yearNRCode, fig.cap="Comparison of the magnitutde of the difference between the mean actual annual effort per hectare estimate and the estimate derived from each reduced data set. Vertical lines represent 1 standard deviation. Walleye recruitment codes are along the x axis. Note the y-axis scale, many of the differences are small. Walleye recruitment codes describe the source of young-of-year walleye in the system and are defined as follows: c=combined equal shares stocked and natural source, cnr=combined mainly from natural, cst=combined mainly from stocking, nr=natural reproduction only, ost=stocking only with few/no adult walleye present,, st=stocked only, NA=not evaluated yet."}
+
+# walleye recruitment class from lchar
+# effort from ceff pooled to survey level
+lEff=calc_creel_effort(creel_count_data = ccou,
+                       creel_int_data = cint,
+                       grouping = c("wbic","survey.seq.no","month","daytype"))
+# current lake classes
+lc=read.csv('lake class predictions.csv') # these come from Rypel et al. 2019 https://doi.org/10.1002/fsh.10228
+lc$LakeClass=gsub(" ","-",lc$LakeClass)
+
+chars=lEff%>%
+  group_by(wbic,survey.seq.no)%>%
+  summarise(effort_hrs=sum(total.effort),
+            effort_hrs.sd=sd(total.effort,na.rm=T))%>%
+  left_join(lchar[,c(1,3,15,35)])%>%
+  mutate(effortHrs.hectare=effort_hrs/(lake.area/2.47),
+         effortHrs.hectare.sd=sd(effort_hrs/(lake.area/2.47),na.rm=T))%>%
+  left_join(lc[,c(1,10)],by=c('wbic'='WBIC'))
+trLake_chars=trLake%>%
+  left_join(lc[,c(1,10)],by=c('wbic'='WBIC'))%>%
+  left_join(lchar[,c(1,35)])%>%
+  left_join(chars)
+
+stClass=trLake_chars%>%
+  group_by(wae.code,treat)%>%
+  summarise(meanDiff=mean(a.diff,na.rm = T),
+            sdDiff=sd(a.diff,na.rm=T))
+ggplot(stClass)+theme_classic()+
+  geom_pointrange(aes(x=wae.code,y=meanDiff,ymin=meanDiff-sdDiff,ymax=meanDiff+sdDiff,color=treat),position = position_dodge(width = 1))+
+  scale_color_viridis_d()+theme(legend.position = c(0.7,0.8))+
+  coord_cartesian(ylim = c(-10,200))+
+  labs(x="WAE Recruitment Code",y="Mean Difference from Actual Effort Estimate",color="Scenario")
+
+
+```
+
+```{r yearLakeClass,fig.cap="Comparison of the magnitude of the difference between the mean actual annual effort per acre estimate and the estimate derived from each reduced data set. Vertical lines represent 1 standard deviation. Note the y-axis scale, many of the differences are very small.  Lake classes are according to Rypel et al. 2019, https://doi.org/10.1002/fsh.10228 ."}
+lcSum=trLake_chars%>%
+  group_by(LakeClass,treat)%>%
+  summarise(meanDiff=mean(a.diff,na.rm = T),
+            sdDiff=sd(a.diff,na.rm=T))
+ggplot(lcSum)+theme_classic()+
+  geom_pointrange(aes(x=LakeClass,y=meanDiff, ymin=meanDiff-sdDiff,ymax=meanDiff+sdDiff,color=treat),position = position_dodge(width = 1))+
+  scale_color_viridis_d()+
+  theme(axis.text.x = element_text(angle=45,hjust = 1), legend.position = c(0.8,0.75))+
+  labs(x="Lake Class",y="Mean Difference from Actual Effort Estimate", color="Scenario")
+```
+
+```{r yearAnalysisLakeArea, fig.cap="Comparison of the magnitude of the difference between the mean actual effort per hectare and the estimate derived from each reduced data set. Note the y-axis scale, many of the differences are small."}
+ggplot(trLake_chars)+theme_classic()+
+  geom_point(aes(y=a.diff,x=log(lake.area/2.47),color=treat))+
+  scale_color_viridis_d()+theme(legend.position = c(0.8,0.4))+
+  labs(x="Log(Lake Area in Hectares)", y="Difference from Actual Effort per Hectare",color="Scenario")
+```
+
+
+```{r year-loop, eval=F, echo=T}
+# MODELING EFFECTS OF DATA REDUCTION ON INDIVIDUAL YEARS
+
+# likelihoods to fit
+effLL.we50=function(param){
+  alpha=param[1]
+  beta=param[2]
+  
+  efs=rlnorm(nrow(tdat[tdat$treat=="we50",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(tdat$total.eff[tdat$treat=="we50"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+effLL.wd50=function(param){
+  alpha=param[1]
+  beta=param[2]
+  
+  efs=rlnorm(nrow(tdat[tdat$treat=="wd50",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(tdat$total.eff[tdat$treat=="wd50"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+effLL.wd25=function(param){
+  alpha=param[1]
+  beta=param[2]
+  
+  efs=rlnorm(nrow(tdat[tdat$treat=="wd25",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(tdat$total.eff[tdat$treat=="wd25"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+effLL.ma=function(param){
+  alpha=param[1]
+  beta=param[2]
+  
+  efs=rlnorm(nrow(tdat[tdat$treat=="mayAug",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(tdat$total.eff[tdat$treat=="mayAug"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+effLL.nw=function(param){
+  alpha=param[1]
+  beta=param[2]
+  
+  efs=rlnorm(nrow(tdat[tdat$treat=="noWinter",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(tdat$total.eff[tdat$treat=="noWinter"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+effLL.a=function(param){
+  alpha=param[1]
+  beta=param[2]
+
+  efs=rlnorm(nrow(tdat[tdat$treat=="actual",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(tdat$total.eff[tdat$treat=="actual"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+
+# removing 0s
+ttrExp=ttrExp[ttrExp$total.eff!=0,]
+loopY=sort(unique(ttrExp$year))
+
+bpval.comp.y=data.frame(year=NA,
+                      scenario=NA,
+                      sd.pval=NA)
+
+bpval.self.y=data.frame(year=NA,
+                        scenario=NA,
+                        sd.pval=NA)
+grMetrics.y=data.frame(year=NA,
+                       scenario=NA,
+                       gr.prsf=NA,
+                       gr.par1=NA,
+                       gr.par2=NA)
+
+for(y in 1:length(loopY)){
+  #first get to year-specific data
+  tdat=ttrExp[ttrExp$year==loopY[y],]
+  # Bayesian Model Fitting
+  #ACTUAL
+
+  prior=createTruncatedNormalPrior(mean=c(mean(log(ttrExp$total.eff[ttrExp$treat=="actual"])),sd(log(ttrExp$total.eff[ttrExp$treat=="actual"]))),
+                                   sd=c(1,1),
+                                   lower = c(-15,0),
+                                   upper = c(15,5))
+
+  setup.a=createBayesianSetup(effLL.a, prior = prior)
+
+  settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+  set.seed(10)
+  t.a=runMCMC(bayesianSetup = setup.a, sampler = "DEzs", settings = settings)
+  #NW
+
+  prior=createTruncatedNormalPrior(mean=c(mean(log(ttrExp$total.eff[ttrExp$treat=="noWinter"])),sd(log(ttrExp$total.eff[ttrExp$treat=="noWinter"]))),
+                                   sd=c(1,1),
+                                   lower = c(-15,0),
+                                   upper = c(15,5))
+
+  setup.nw=createBayesianSetup(effLL.nw, prior = prior)
+
+  settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+  set.seed(10)
+  t.nw=runMCMC(bayesianSetup = setup.nw, sampler = "DEzs", settings = settings)
+  #MA
+
+  prior=createTruncatedNormalPrior(mean=c(mean(log(ttrExp$total.eff[ttrExp$treat=="mayAug"])),sd(log(ttrExp$total.eff[ttrExp$treat=="mayAug"]))),
+                                   sd=c(1,1),
+                                   lower = c(-15,0),
+                                   upper = c(15,5))
+
+  setup.ma=createBayesianSetup(effLL.ma, prior = prior)
+
+  settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+  set.seed(10)
+  t.ma=runMCMC(bayesianSetup = setup.ma, sampler = "DEzs", settings = settings)
+  #WD.25
+
+  prior=createTruncatedNormalPrior(mean=c(mean(log(ttrExp$total.eff[ttrExp$treat=="wd25"])),sd(log(ttrExp$total.eff[ttrExp$treat=="wd25"]))),
+                                   sd=c(1,1),
+                                   lower = c(-15,0),
+                                   upper = c(15,5))
+
+  setup.wd25=createBayesianSetup(effLL.wd25, prior = prior)
+
+  settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+  set.seed(10)
+  t.25wd=runMCMC(bayesianSetup = setup.wd25, sampler = "DEzs", settings = settings)
+  #WD.50
+
+  prior=createTruncatedNormalPrior(mean=c(mean(log(ttrExp$total.eff[ttrExp$treat=="wd50"])),sd(log(ttrExp$total.eff[ttrExp$treat=="wd50"]))),
+                                   sd=c(1,1),
+                                   lower = c(-15,0),
+                                   upper = c(15,5))
+
+  setup.wd50=createBayesianSetup(effLL.wd50, prior = prior)
+
+  settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+  set.seed(10)
+  t.50wd=runMCMC(bayesianSetup = setup.wd50, sampler = "DEzs", settings = settings)
+
+  #WE.50
+
+  prior=createTruncatedNormalPrior(mean=c(mean(log(ttrExp$total.eff[ttrExp$treat=="we50"])),sd(log(ttrExp$total.eff[ttrExp$treat=="we50"]))),
+                                   sd=c(1,1),
+                                   lower = c(-15,0),
+                                   upper = c(15,5))
+
+  setup.we50=createBayesianSetup(effLL.we50, prior = prior)
+
+  settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+  set.seed(10)
+  t.50we=runMCMC(bayesianSetup = setup.we50, sampler = "DEzs", settings = settings)
+  
+  ## GR Diagnostics to record for each year
+  
+  gr.a=gelmanDiagnostics(t.a)
+  gr.ma=gelmanDiagnostics(t.ma)
+  gr.nw=gelmanDiagnostics(t.nw)
+  gr.wd25=gelmanDiagnostics(t.25wd)
+  gr.wd50=gelmanDiagnostics(t.50wd)
+  gr.we50=gelmanDiagnostics(t.50we)
+  
+    ## BAYESIAN P-VALUE CALCS to record for each year
+
+  pars.a=getSample(t.a)
+  pars.nw=getSample(t.nw)
+  pars.ma=getSample(t.ma)
+  pars.wd25=getSample(t.25wd)
+  pars.wd50=getSample(t.50wd)
+  pars.we50=getSample(t.50we)
+
+  #### Pb ACTUAL ####
+  pval.actual=data.frame(alpha=rep(NA,nrow(pars.a)),
+                         beta=NA,
+                         sd=NA)
+  set.seed(10)
+  for(i in 1:nrow(pars.a)){
+    tempdat=rlnorm(n=length(tdat$total.eff[tdat$treat=="actual"]),
+                   meanlog = pars.a[i,1],
+                   sdlog = pars.a[i,2])
+    pval.actual$alpha[i]=pars.a[i,1]
+    pval.actual$beta[i]=pars.a[i,2]
+    pval.actual$sd[i]=sd(log(tempdat))
+  }
+
+  # now calculate the number of times the sd exceeds that of the real data
+
+  pval.actual$sdExceed=0
+
+  actual.sd=sd(log(tdat$total.eff[tdat$treat=="actual"]))
+
+  pval.actual$sdExceed[pval.actual$sd>actual.sd]=1
+
+  #### Pb NO WINTER ####
+  pval.noWinter=data.frame(alpha=rep(NA,nrow(pars.nw)),
+                           beta=NA,
+                           sd=NA)
+  set.seed(10)
+  for(i in 1:nrow(pars.nw)){
+    tempdat=rlnorm(n=length(tdat$total.eff[tdat$treat=="noWinter"]),
+                   meanlog = pars.nw[i,1],
+                   sdlog = pars.nw[i,2])
+    pval.noWinter$alpha[i]=pars.nw[i,1]
+    pval.noWinter$beta[i]=pars.nw[i,2]
+    pval.noWinter$sd[i]=sd(log(tempdat))
+  }
+
+  # now calculate the number of times the sd exceeds that of the real data
+
+  pval.noWinter$sdExceed=0
+
+  noWinter.sd=sd(log(tdat$total.eff[tdat$treat=="noWinter"]))
+
+  pval.noWinter$sdExceed[pval.noWinter$sd>noWinter.sd]=1
+
+  #### Pb MAYAUGUST ####
+  pval.mayAug=data.frame(alpha=rep(NA,nrow(pars.ma)),
+                         beta=NA,
+                         sd=NA)
+  set.seed(10)
+  for(i in 1:nrow(pars.ma)){
+    tempdat=rlnorm(n=length(tdat$total.eff[tdat$treat=="mayAug"]),
+                   meanlog = pars.ma[i,1],
+                   sdlog = pars.ma[i,2])
+    pval.mayAug$alpha[i]=pars.ma[i,1]
+    pval.mayAug$beta[i]=pars.ma[i,2]
+    pval.mayAug$sd[i]=sd(log(tempdat))
+  }
+
+  # now calculate the number of times the sd exceeds that of the real data
+
+  pval.mayAug$sdExceed=0
+
+  mayAug.sd=sd(log(tdat$total.eff[tdat$treat=="mayAug"]))
+
+  pval.mayAug$sdExceed[pval.mayAug$sd>mayAug.sd]=1
+
+  #### Pb WD25 ####
+  pval.wd25=data.frame(alpha=rep(NA,nrow(pars.wd25)),
+                       beta=NA,
+                       sd=NA)
+  set.seed(10)
+  for(i in 1:nrow(pars.wd25)){
+    tempdat=rlnorm(n=length(tdat$total.eff[tdat$treat=="wd25"]),
+                   meanlog = pars.wd25[i,1],
+                   sdlog = pars.wd25[i,2])
+    pval.wd25$alpha[i]=pars.wd25[i,1]
+    pval.wd25$beta[i]=pars.wd25[i,2]
+    pval.wd25$sd[i]=sd(log(tempdat))
+  }
+
+  # now calculate the number of times the sd exceeds that of the real data
+
+  pval.wd25$sdExceed=0
+
+  wd25.sd=sd(log(tdat$total.eff[tdat$treat=="wd25"]))
+
+  pval.wd25$sdExceed[pval.wd25$sd>wd25.sd]=1
+
+  #### Pb WD50 ####
+  pval.wd50=data.frame(alpha=rep(NA,nrow(pars.wd50)),
+                       beta=NA,
+                       sd=NA)
+  set.seed(10)
+  for(i in 1:nrow(pars.wd50)){
+    tempdat=rlnorm(n=length(tdat$total.eff[tdat$treat=="wd50"]),
+                   meanlog = pars.wd50[i,1],
+                   sdlog = pars.wd50[i,2])
+    pval.wd50$alpha[i]=pars.wd50[i,1]
+    pval.wd50$beta[i]=pars.wd50[i,2]
+    pval.wd50$sd[i]=sd(log(tempdat))
+  }
+
+  # now calculate the number of times the sd exceeds that of the real data
+
+  pval.wd50$sdExceed=0
+
+  wd50.sd=sd(log(tdat$total.eff[tdat$treat=="wd50"]))
+
+  pval.wd50$sdExceed[pval.wd50$sd>wd50.sd]=1
+
+  #### Pb WE50 ####
+  pval.we50=data.frame(alpha=rep(NA,nrow(pars.we50)),
+                       beta=NA,
+                       sd=NA)
+  set.seed(10)
+  for(i in 1:nrow(pars.we50)){
+    tempdat=rlnorm(n=length(tdat$total.eff[tdat$treat=="we50"]),
+                   meanlog = pars.we50[i,1],
+                   sdlog = pars.we50[i,2])
+    pval.we50$alpha[i]=pars.we50[i,1]
+    pval.we50$beta[i]=pars.we50[i,2]
+    pval.we50$sd[i]=sd(log(tempdat))
+  }
+
+  # now calculate the number of times the sd exceeds that of the real data
+
+  pval.we50$sdExceed=0
+
+  we50.sd=sd(log(tdat$total.eff[tdat$treat=="we50"]))
+
+  pval.we50$sdExceed[pval.we50$sd>we50.sd]=1
+
+  #df to hold pvals for model comparison to self, a way of knowing the model fit the data well
+  t.pself=data.frame(year=rep(loopY[y],6),
+                     scenario=c("Actual", "No Winter", "May-August","25% weeday removal","50% weekday removal","50% weekend removal"),
+                     sd.pval=NA)
+  # adding self comparison pvals
+  t.pself$sd.pval=c(sum(pval.actual$sdExceed)/nrow(pval.actual),
+                          sum(pval.noWinter$sdExceed)/nrow(pval.noWinter),
+                          sum(pval.mayAug$sdExceed)/nrow(pval.mayAug),
+                          sum(pval.wd25$sdExceed)/nrow(pval.wd25),
+                          sum(pval.wd50$sdExceed)/nrow(pval.wd50),
+                          sum(pval.we50$sdExceed)/nrow(pval.we50))
+  bpval.self.y=rbind(bpval.self.y,t.pself)
+  ## p-value tests comparing the scenarios to actual to show that some scenarios approximate the actual quite well.
+
+  t.pcomp=data.frame(year=rep(loopY[y],6),
+                     scenario=c("Actual", "No Winter", "May-August","25% weeday removal","50% weekday removal","50% weekend removal"),
+                     sd.pval=NA)
+
+  pval.actual$sdComp=0
+  pval.actual$sdComp[pval.actual$sd>actual.sd]=1
+
+  pval.noWinter$sdComp=0
+  pval.noWinter$sdComp[pval.noWinter$sd>actual.sd]=1
+
+  pval.mayAug$sdComp=0
+  pval.mayAug$sdComp[pval.mayAug$sd>actual.sd]=1
+
+  pval.wd25$sdComp=0
+  pval.wd25$sdComp[pval.wd25$sd>actual.sd]=1
+
+  pval.wd50$sdComp=0
+  pval.wd50$sdComp[pval.wd50$sd>actual.sd]=1
+
+  pval.we50$sdComp=0
+  pval.we50$sdComp[pval.we50$sd>actual.sd]=1
+
+   t.pcomp$sd.pval=c(sum(pval.actual$sdComp)/nrow(pval.actual),
+                       sum(pval.noWinter$sdComp)/nrow(pval.noWinter),
+                       sum(pval.mayAug$sdComp)/nrow(pval.mayAug),
+                       sum(pval.wd25$sdComp)/nrow(pval.wd25),
+                       sum(pval.wd50$sdComp)/nrow(pval.wd50),
+                       sum(pval.we50$sdComp)/nrow(pval.we50))
+  bpval.comp.y=rbind(bpval.comp.y,t.pcomp)
+  
+  # adding GR results to the output dataframe
+  t.gr=data.frame(year=rep(loopY[y],6),
+                  scenario=c("Actual", "No Winter", "May-August","25% weeday removal","50% weekday removal","50% weekend removal"),
+                  gr.prsf=c(gr.a[[2]],gr.nw[[2]],gr.ma[[2]],gr.wd25[[2]],gr.wd50[[2]],gr.we50[[2]]),
+                  gr.par1=c(gr.a[[1]][1,1],gr.nw[[1]][1,1],gr.ma[[1]][1,1],gr.wd25[[1]][1,1],gr.wd50[[1]][1,1],gr.we50[[1]][1,1]),
+                  gr.par2=c(gr.a[[1]][2,1],gr.nw[[1]][2,1],gr.ma[[1]][2,1],gr.wd25[[1]][2,1],gr.wd50[[1]][2,1],gr.we50[[1]][2,1]))
+  grMetrics.y=rbind(grMetrics.y,t.gr)
+}
+
+# saving big loop's output since it takes a while to run
+yearLoopOutput=list(bpval.self.y,bpval.comp.y,grMetrics.y)
+#saveRDS(yearLoopOutput, file = "yearLoopOutput_effort_9.23.25.RData")
+
+
+```
+
+```{r year-loop-preload, fig.width=8, fig.height=8, fig.cap="Distribution of effort estimates across years in the creel data set. Different data reduction scenarios are noted with varying colors."}
+# first a couple exploratory plots of u distribution by year
+# reading in model object from above
+yearLoopOutput=readRDS("yearLoopOutput_effort_9.23.25.RData")
+
+bpval.self.y=yearLoopOutput[[1]]
+bpval.self.y=bpval.self.y[!is.na(bpval.self.y$scenario),]
+bpval.comp.y=yearLoopOutput[[2]]
+bpval.comp.y=bpval.comp.y[!is.na(bpval.comp.y$scenario),]
+grMetrics.y=yearLoopOutput[[3]]
+grMetrics.y=grMetrics.y[!is.na(grMetrics.y$scenario),]
+ggplot(ttrExp)+theme_classic()+
+  geom_density(aes(log(total.eff),fill=treat),alpha=0.2)+
+  facet_wrap(~year,scales = 'free_y')+scale_fill_viridis_d()+
+  theme(legend.position = "bottom")+
+  labs(y="Density",x="Log(Annual Effort per Hectare)", fill="Scenario")
+```
+
+```{r year-loop-model-fit, fig.cap="Comparison of coefficient of variations for bayesian p-values comparing the actual data to the simulated data for the creel year and data reduction scenario."}
+
+ggplot(bpval.self.y)+theme_classic()+
+  geom_point(aes(x=year, y=sd.pval))+facet_wrap(~scenario)+
+  geom_hline(yintercept = c(0.9,0.5,0.1),color="red")+
+  coord_cartesian(ylim=c(0,1))
+```
+
+```{r yearLoopComp, fig.cap="Comparison of the coeffienct of variations for bayesian p-values comparing the simulated data from each creel year and data reduction scenario to the actual data for that same creel year."}
+
+ggplot(bpval.comp.y)+theme_classic()+
+  geom_point(aes(x=year, y=sd.pval))+facet_wrap(~scenario)+
+  geom_hline(yintercept = c(0.9,0.5,0.1),color="red")+
+  coord_cartesian(ylim=c(0,1))
+```
+
+```{r yearGRmetric, fig.cap="Gelman-Rubin diagnostic results for the year-by-year model fitting. All years with  available data had models successfully converge with a Gelman-Rubin score below the 1.1 threshold required for convergence (red horizonal line)."}
+# model convergence
+ggplot(grMetrics.y)+theme_classic()+
+  geom_point(aes(x=year, y=gr.prsf))+facet_wrap(~scenario)+
+  coord_cartesian(ylim=c(1,1.2))+
+  geom_hline(yintercept = 1.1, color='red')+
+  labs(y='Gelman-Rubin Score',x='Year')
+```
+
+### Alternative modeling distributions
+
+Instead of the lognormal distribution there is one other probability distributions that could be used to model this data based on the characteristics of the data and the data characteristics assumed by each of the distributions.
+
+Table of data distributions and their definitions:
+
+| Distribution | Definition                                                                                                                                |
+|-------------------------------------|-----------------------------------|
+| Lognormal    | Continuously distributed quantities with nonnegative values. Random variables with the property that their logs are normally distributed. |
+| Gamma        | Any continuous quantity that is nonnegative. Continuous version of a Poisson distribution.                                                |
+
+The following analyses will compare the ability of models using the lognormal and gamma distributions to fit the full data and each of the reduced data set.
+A cursory look at the ability of gamma distributed models showed no real difference from beta and lognormal and the definition of the beta better represents the data we're dealing with than the gamma definition so further analyses with this family of models was not pursued (Figure \@ref(fig:quickGammaFit)).
+The purpose of the comparison between lognormal and beta family models is not to see which model provided the most convenient answer but to compare their ability to fit the data.
+All comparisons presented in this analysis are comparing a model's ability to fit the data **within** each dataset and **not** across data sets which is what is necessary to gain inference on the effect of any data reductions.
+
+```{r gammaFits}
+## FITTING ALTERNATIVE DISTRIBUTIONS ####
+# combining actual and reduced dataframes into one big one for plotting
+
+ttrExp=rbind(cbind(eff.surv.a,treat=rep("actual",nrow(eff.surv.a))),
+             cbind(eff.surv.nw, treat=rep("noWinter",nrow(eff.surv.nw))),
+             cbind(eff.surv.ma, treat=rep("mayAug",nrow(eff.surv.ma))),
+             cbind(eff.surv.25wd, treat=rep("wd25",nrow(eff.surv.25wd))),
+             cbind(eff.surv.50wd, treat=rep("wd50",nrow(eff.surv.50wd))),
+             cbind(eff.surv.50we, treat=rep("we50",nrow(eff.surv.50we))))
+
+# removing 0s, not necessary for gamma fit, but is for lognormal fit
+ttrExp=ttrExp[ttrExp$total.eff!=0,]
+ggplot(ttrExp)+theme_classic()+
+  geom_density(aes(x=total.eff, fill=treat),alpha=0.2)
+
+effLL.a.gamma=function(param){
+  shape=param[1]
+  rate=param[2]
+
+  efs=rgamma(nrow(ttrExp[ttrExp$treat=="actual",]), shape = shape, rate = rate)
+  mu=mean(efs,na.rm = T)
+  sigma2=var(efs,na.rm = T)
+  
+  ll=dgamma(ttrExp$total.eff[ttrExp$treat=="actual"], shape = mu^2/sigma2, rate = mu/sigma2, log = T)
+  return(sum(ll))
+}
+
+prior=createUniformPrior(lower=c(0,0), upper = c(3000,4000))
+setup.actual=createBayesianSetup(effLL.a.gamma, prior = prior)
+
+settings=list(iterations=50000, nrChains=3, message=F, burnin=10000)
+
+startT=Sys.time()
+set.seed(10)
+eff.actual.gamma=runMCMC(bayesianSetup = setup.actual, sampler = "DEzs", settings = settings)
+endT=Sys.time() # takes about 10 sec
+
+effLL.a=function(param){
+  alpha=param[1]
+  beta=param[2]
+
+  efs=rlnorm(nrow(ttrExp[ttrExp$treat=="actual",]),meanlog = alpha, sdlog = beta)
+  ll=dlnorm(ttrExp$total.eff[ttrExp$treat=="actual"], meanlog = mean(log(efs)), sdlog = sd(log(efs)), log = T)
+  return(sum(ll))
+}
+
+prior=createTruncatedNormalPrior(mean=c(mean(log(ttrExp$total.eff[ttrExp$treat=="actual"])),sd(log(ttrExp$total.eff[ttrExp$treat=="actual"]))),
+                                 sd=c(1,1),
+                                 lower = c(-15,0),
+                                 upper = c(15,5))
+
+setup.actual=createBayesianSetup(effLL.a, prior = prior)
+
+settings=list(iterations=10000, nrChains=3, message=F, burnin=5000)
+set.seed(10)
+eff.actual=runMCMC(bayesianSetup = setup.actual, sampler = "DEzs", settings = settings) # takes about 10 seconds
+
+
+# working through rest of the reduced data sets and then calculating pvalues
+#### NW ####
+effLL.nw.gamma=function(param){
+  shape=param[1]
+  rate=param[2]
+
+  efs=rgamma(nrow(ttrExp[ttrExp$treat=="noWinter",]), shape = shape, rate = rate)
+  mu=mean(efs,na.rm = T)
+  sigma2=var(efs,na.rm = T)
+  
+  ll=dgamma(ttrExp$total.eff[ttrExp$treat=="noWinter"], shape = mu^2/sigma2, rate = mu/sigma2, log = T)
+  return(sum(ll))
+}
+
+prior.gamma=createUniformPrior(lower=c(0,0), upper = c(3000,4000))
+setup.nw.gamma=createBayesianSetup(effLL.nw.gamma, prior = prior.gamma)
+
+settings=list(iterations=50000, nrChains=3, message=F, burnin=10000)
+
+set.seed(10)
+eff.nw.gamma=runMCMC(bayesianSetup = setup.nw.gamma, sampler = "DEzs", settings = settings)
+
+#### MA ####
+
+effLL.ma.gamma=function(param){
+  shape=param[1]
+  rate=param[2]
+
+  efs=rgamma(nrow(ttrExp[ttrExp$treat=="mayAug",]), shape = shape, rate = rate)
+  mu=mean(efs,na.rm = T)
+  sigma2=var(efs,na.rm = T)
+  
+  ll=dgamma(ttrExp$total.eff[ttrExp$treat=="mayAug"], shape = mu^2/sigma2, rate = mu/sigma2, log = T)
+  return(sum(ll))
+}
+
+prior.gamma=createUniformPrior(lower=c(0,0), upper = c(3000,4000))
+setup.ma.gamma=createBayesianSetup(effLL.ma.gamma, prior = prior.gamma)
+
+settings=list(iterations=50000, nrChains=3, message=F, burnin=10000)
+
+set.seed(10)
+eff.ma.gamma=runMCMC(bayesianSetup = setup.ma.gamma, sampler = "DEzs", settings = settings)
+
+#### WD25 ####
+
+effLL.wd25.gamma=function(param){
+  shape=param[1]
+  rate=param[2]
+
+  efs=rgamma(nrow(ttrExp[ttrExp$treat=="wd25",]), shape = shape, rate = rate)
+  mu=mean(efs,na.rm = T)
+  sigma2=var(efs,na.rm = T)
+  
+  ll=dgamma(ttrExp$total.eff[ttrExp$treat=="wd25"], shape = mu^2/sigma2, rate = mu/sigma2, log = T)
+  return(sum(ll))
+}
+
+prior.gamma=createUniformPrior(lower=c(0,0), upper = c(3000,4000))
+setup.wd25.gamma=createBayesianSetup(effLL.wd25.gamma, prior = prior.gamma)
+
+settings=list(iterations=50000, nrChains=3, message=F, burnin=10000)
+set.seed(10)
+eff.25wd.gamma=runMCMC(bayesianSetup = setup.wd25.gamma, sampler = "DEzs", settings = settings)
+
+#### WD50 ####
+effLL.wd50.gamma=function(param){
+  shape=param[1]
+  rate=param[2]
+
+  efs=rgamma(nrow(ttrExp[ttrExp$treat=="wd50",]), shape = shape, rate = rate)
+  mu=mean(efs,na.rm = T)
+  sigma2=var(efs,na.rm = T)
+  
+  ll=dgamma(ttrExp$total.eff[ttrExp$treat=="wd50"], shape = mu^2/sigma2, rate = mu/sigma2, log = T)
+  return(sum(ll))
+}
+
+prior.gamma=createUniformPrior(lower=c(0,0), upper = c(3000,4000))
+setup.wd50.gamma=createBayesianSetup(effLL.wd50.gamma, prior = prior.gamma)
+
+settings=list(iterations=50000, nrChains=3, message=F, burnin=10000)
+
+set.seed(10)
+eff.50wd.gamma=runMCMC(bayesianSetup = setup.wd50.gamma, sampler = "DEzs", settings = settings)
+
+#### WE50 ####
+effLL.we50.gamma=function(param){
+  shape=param[1]
+  rate=param[2]
+
+  efs=rgamma(nrow(ttrExp[ttrExp$treat=="we50",]), shape = shape, rate = rate)
+  mu=mean(efs,na.rm = T)
+  sigma2=var(efs,na.rm = T)
+  
+  ll=dgamma(ttrExp$total.eff[ttrExp$treat=="we50"], shape = mu^2/sigma2, rate = mu/sigma2, log = T)
+  return(sum(ll))
+}
+
+prior.gamma=createUniformPrior(lower=c(0,0), upper = c(3000,4000))
+setup.we50.gamma=createBayesianSetup(effLL.we50.gamma, prior = prior.gamma)
+
+settings=list(iterations=50000, nrChains=3, message=F, burnin=10000)
+
+set.seed(10)
+eff.50we.gamma=runMCMC(bayesianSetup = setup.we50.gamma, sampler = "DEzs", settings = settings)
+```
+
+```{r quickGammaFit, fig.cap="Comparison of model fits for lognormal and gamma, family of models. This rough look at the models suggests there are no obvious differences between the choice of modeling distribution. This will be evaluated statistically using bayesian p values later on."}
+# evaluating model fit
+
+pars.a.lnorm=getSample(eff.actual)
+pars.a.gamma=getSample(eff.actual.gamma)
+
+set.seed(10)
+aComp.lnorm=data.frame(eff.hectare=c(ttrExp$total.eff[ttrExp$treat=="actual"],rlnorm(n=length(ttrExp$total.eff[ttrExp$treat=="actual"]),
+                                                                    meanlog = median(pars.a.lnorm[,1]),
+                                                                    sdlog = median(pars.a.lnorm[,2]))),
+                 treat=c(rep("observed",length(ttrExp$total.eff[ttrExp$treat=="actual"])),rep("pred",length(ttrExp$total.eff[ttrExp$treat=="actual"]))))
+
+aComp.gamma=data.frame(eff.hectare=c(ttrExp$total.eff[ttrExp$treat=="actual"],rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="actual"]),
+                                                                    shape = median(pars.a.gamma[,1]),
+                                                                    rate = median(pars.a.gamma[,2]))),
+                  treat=c(rep("observed",length(ttrExp$total.eff[ttrExp$treat=="actual"])),rep("pred",length(ttrExp$total.eff[ttrExp$treat=="actual"]))))
+
+ln=ggplot(aComp.lnorm)+theme_classic()+
+  geom_density(aes(x=eff.hectare, fill=treat),alpha=0.3)+
+  scale_fill_viridis_d()+labs(x="Annual Effort per Hectare",title = "Lognormal")+
+  theme(legend.position = c(0.75,0.75))
+gma=ggplot(aComp.gamma)+theme_classic()+
+  geom_density(aes(x=eff.hectare, fill=treat),alpha=0.3)+
+  scale_fill_viridis_d()+labs(x="Annual Effort per Hectare",title = "Gamma")+
+  theme(legend.position = c(0.75,0.75))
+ggarrange(ln,gma)
+
+```
+
+```{r gammaFitViz, fig.cap="Visualization of the model fit to the data for each scenario using a gamma distribution instead of a lognormal distribution."}
+# looking to see if parm estimates produce data that visually at least looks like the observed data for that scenario
+pars.a.gamma=getSample(eff.actual.gamma)
+pars.nw.gamma=getSample(eff.nw.gamma)
+pars.ma.gamma=getSample(eff.ma.gamma)
+pars.wd25.gamma=getSample(eff.25wd.gamma)
+pars.wd50.gamma=getSample(eff.50wd.gamma)
+pars.we50.gamma=getSample(eff.50we.gamma)
+set.seed(10)
+aComp.gamma=data.frame(eff.hectare=c(ttrExp$total.eff[ttrExp$treat=="actual"],rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="actual"]),
+                                                                    shape = median(pars.a.gamma[,1]),
+                                                                    rate = median(pars.a.gamma[,2]))),
+                  treat=c(rep("observed",length(ttrExp$total.eff[ttrExp$treat=="actual"])),rep("pred",length(ttrExp$total.eff[ttrExp$treat=="actual"]))))
+nwComp.gamma=data.frame(eff.hectare=c(ttrExp$total.eff[ttrExp$treat=="noWinter"],rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="noWinter"]),
+                                                                      shape = median(pars.nw.gamma[,1]),
+                                                                      rate = median(pars.nw.gamma[,2]))),
+                  treat=c(rep("observed",length(ttrExp$total.eff[ttrExp$treat=="noWinter"])),rep("pred",length(ttrExp$total.eff[ttrExp$treat=="noWinter"]))))
+
+maComp.gamma=data.frame(eff.hectare=c(ttrExp$total.eff[ttrExp$treat=="mayAug"],rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="mayAug"]),
+                                                                    shape = median(pars.ma.gamma[,1]),
+                                                                    rate = median(pars.ma.gamma[,2]))),
+                  treat=c(rep("observed",length(ttrExp$total.eff[ttrExp$treat=="mayAug"])),rep("pred",length(ttrExp$total.eff[ttrExp$treat=="mayAug"]))))
+
+wd25Comp.gamma=data.frame(eff.hectare=c(ttrExp$total.eff[ttrExp$treat=="wd25"],rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="wd25"]),
+                                                                    shape = median(pars.wd25.gamma[,1]),
+                                                                    rate = median(pars.wd25.gamma[,2]))),
+                    treat=c(rep("observed",length(ttrExp$total.eff[ttrExp$treat=="wd25"])),rep("pred",length(ttrExp$total.eff[ttrExp$treat=="wd25"]))))
+
+wd50Comp.gamma=data.frame(eff.hectare=c(ttrExp$total.eff[ttrExp$treat=="wd50"],rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="wd50"]),
+                                                                    shape = median(pars.wd50.gamma[,1]),
+                                                                    rate = median(pars.wd50.gamma[,2]))),
+                    treat=c(rep("observed",length(ttrExp$total.eff[ttrExp$treat=="wd50"])),rep("pred",length(ttrExp$total.eff[ttrExp$treat=="wd50"]))))
+
+we50Comp.gamma=data.frame(eff.hectare=c(ttrExp$total.eff[ttrExp$treat=="we50"],rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="we50"]),
+                                                                    shape = median(pars.we50.gamma[,1]),
+                                                                    rate = median(pars.we50.gamma[,2]))),
+                    treat=c(rep("observed",length(ttrExp$total.eff[ttrExp$treat=="we50"])),rep("pred",length(ttrExp$total.eff[ttrExp$treat=="we50"]))))
+
+a.p.gamma=ggplot(aComp.gamma)+theme_classic()+
+  geom_density(aes(x=eff.hectare,fill=treat),alpha=0.2)+coord_cartesian(xlim = c(0,250))+
+  scale_fill_viridis_d()+labs(x="Annual Effort per Hectare", y="Density", title = "Actual", fill=element_blank())
+nw.p.gamma=ggplot(nwComp.gamma)+theme_classic()+
+  geom_density(aes(x=eff.hectare,fill=treat),alpha=0.2)+coord_cartesian(xlim = c(0,250))+
+  scale_fill_viridis_d()+labs(x="Annual Effort per Hectare", y="Density", title = "No Winter Data \n(April - October)", fill=element_blank())
+ma.p.gamma=ggplot(maComp.gamma)+theme_classic()+
+  geom_density(aes(x=eff.hectare,fill=treat),alpha=0.2)+coord_cartesian(xlim = c(0,250))+
+  scale_fill_viridis_d()+labs(x="Annual Effort per Hectare", y="Density", title = "May - August \nData Only", fill=element_blank())
+wd25.p.gamma=ggplot(wd25Comp.gamma)+theme_classic()+
+  geom_density(aes(x=eff.hectare,fill=treat),alpha=0.2)+coord_cartesian(xlim = c(0,250))+
+  scale_fill_viridis_d()+labs(x="Annual Effort per Hectare", y="Density", title = "25% of Weekday \nCreel Visits/Month \nRemoved", fill=element_blank())
+wd50.p.gamma=ggplot(wd25Comp.gamma)+theme_classic()+
+  geom_density(aes(x=eff.hectare,fill=treat),alpha=0.2)+coord_cartesian(xlim = c(0,250))+
+  scale_fill_viridis_d()+labs(x="Annual Effort per Hectare", y="Density", title = "50% of Weekday \nCreel Visits/Month \nRemoved", fill=element_blank())
+we50.p.gamma=ggplot(we50Comp.gamma)+theme_classic()+
+  geom_density(aes(x=eff.hectare,fill=treat),alpha=0.2)+coord_cartesian(xlim = c(0,250))+
+  scale_fill_viridis_d()+labs(x="Annual Effort per Hectare", y="Density", title = "50% of Weekdend \nCreel Visits/Month \nRemoved", fill=element_blank())
+
+ggarrange(a.p.gamma,nw.p.gamma,ma.p.gamma,wd25.p.gamma,wd50.p.gamma,we50.p.gamma, common.legend = T)
+```
+
+Gelman-Rubin convergence diagnostics indicate all models have converged.
+Seems like the gamma models could be a potential alternative, the bayesian p values should help confirm this.
+
+```{r betaGRDiagnostics, eval=F, echo=T}
+### MODEL CHECKNG ####
+
+gelmanDiagnostics(eff.actual.gamma) # converged
+gelmanDiagnostics(eff.nw.gamma) # converged
+gelmanDiagnostics(eff.ma.gamma) # converged
+gelmanDiagnostics(eff.25wd.gamma) # converged
+gelmanDiagnostics(eff.50wd.gamma) # converged
+gelmanDiagnostics(eff.50we.gamma) # converged
+
+```
+
+```{r gammaPVals}
+# bayesian p-value for each model
+# dataframe to hold output
+bpval.self.gamma=data.frame(scenario=c("Actual", "No Winter", "May-August","25% weeday removal","50% weekday removal","50% weekend removal"),
+                    sd.pval=NA)
+#### Pb ACTUAL ####
+pval.actual=data.frame(shape=rep(NA,nrow(pars.a.gamma)),
+                       rate=NA,
+                       sd=NA)
+set.seed(10)
+for(i in 1:nrow(pars.a.gamma)){
+  tempdat=rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="actual"]),
+                 shape = pars.a.gamma[i,1],
+                 rate = pars.a.gamma[i,2])
+  pval.actual$shape[i]=pars.a.gamma[i,1]
+  pval.actual$rate[i]=pars.a.gamma[i,2]
+  pval.actual$sd[i]=sd(tempdat)
+}
+
+# now calculate the number of times the sd exceeds that of the real data
+
+pval.actual$sdExceed=0
+
+actual.sd=sd(ttrExp$total.eff[ttrExp$treat=="actual"])
+
+pval.actual$sdExceed[pval.actual$sd>actual.sd]=1
+
+bpval.self.gamma$sd.pval[1]=sum(pval.actual$sdExceed==1)/nrow(pval.actual) # if this value is < 0.1 for >0.9 that would suggest model is not fitting well. 0.5 is ideal
+
+
+#### Pb NO WINTER ####
+pval.noWinter=data.frame(shape=rep(NA,nrow(pars.nw.gamma)),
+                         rate=NA,
+                         sd=NA)
+set.seed(10)
+for(i in 1:nrow(pars.nw.gamma)){
+  tempdat=rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="noWinter"]),
+                shape = pars.nw.gamma[i,1],
+                rate = pars.nw.gamma[i,2])
+  pval.noWinter$shape[i]=pars.nw.gamma[i,1]
+  pval.noWinter$rate[i]=pars.nw.gamma[i,2]
+  pval.noWinter$sd[i]=sd(tempdat)
+}
+
+# now calculate the number of times the sd exceeds that of the real data
+
+pval.noWinter$sdExceed=0
+
+noWinter.sd=sd(ttrExp$total.eff[ttrExp$treat=="noWinter"])
+
+pval.noWinter$sdExceed[pval.noWinter$sd>noWinter.sd]=1
+
+bpval.self.gamma$sd.pval[2]=sum(pval.noWinter$sdExceed==1)/nrow(pval.noWinter) # if this value is < 0.1 for >0.9 that would suggest model is not fitting well. 0.5 is ideal
+
+#### Pb MAYAUGUST ####
+pval.mayAug=data.frame(shape=rep(NA,nrow(pars.ma.gamma)),
+                       rate=NA,
+                       sd=NA)
+set.seed(10)
+for(i in 1:nrow(pars.ma.gamma)){
+  tempdat=rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="mayAug"]),
+                shape = pars.ma.gamma[i,1],
+                rate = pars.ma.gamma[i,2])
+  pval.mayAug$shape[i]=pars.ma.gamma[i,1]
+  pval.mayAug$rate[i]=pars.ma.gamma[i,2]
+  pval.mayAug$sd[i]=sd(tempdat)
+}
+
+# now calculate the number of times the sd exceeds that of the real data
+
+pval.mayAug$sdExceed=0
+
+mayAug.sd=sd(ttrExp$total.eff[ttrExp$treat=="mayAug"])
+
+pval.mayAug$sdExceed[pval.mayAug$sd>mayAug.sd]=1
+
+bpval.self.gamma$sd.pval[3]=sum(pval.mayAug$sdExceed==1)/nrow(pval.mayAug) # if this value is < 0.1 for >0.9 that would suggest model is not fitting well. 0.5 is ideal
+
+#### Pb WD25 ####
+pval.wd25=data.frame(shape=rep(NA,nrow(pars.wd25.gamma)),
+                     rate=NA,
+                     sd=NA)
+set.seed(10)
+for(i in 1:nrow(pars.wd25.gamma)){
+  tempdat=rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="wd25"]),
+                shape = pars.wd25.gamma[i,1],
+                rate = pars.wd25.gamma[i,2])
+  pval.wd25$shape[i]=pars.wd25.gamma[i,1]
+  pval.wd25$rate[i]=pars.wd25.gamma[i,2]
+  pval.wd25$sd[i]=sd(tempdat)
+}
+
+# now calculate the number of times the sd exceeds that of the real data
+
+pval.wd25$sdExceed=0
+
+wd25.sd=sd(ttrExp$total.eff[ttrExp$treat=="wd25"])
+
+pval.wd25$sdExceed[pval.wd25$sd>wd25.sd]=1
+
+bpval.self.gamma$sd.pval[4]=sum(pval.wd25$sdExceed==1)/nrow(pval.wd25) # if this value is < 0.1 for >0.9 that would suggest model is not fitting well. 0.5 is ideal
+
+#### Pb WD50 ####
+pval.wd50=data.frame(shape=rep(NA,nrow(pars.wd50.gamma)),
+                     rate=NA,
+                     sd=NA)
+set.seed(10)
+for(i in 1:nrow(pars.wd50.gamma)){
+  tempdat=rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="wd50"]),
+                shape = pars.wd50.gamma[i,1],
+                rate = pars.wd50.gamma[i,2])
+  pval.wd50$shape[i]=pars.wd50.gamma[i,1]
+  pval.wd50$rate[i]=pars.wd50.gamma[i,2]
+  pval.wd50$sd[i]=sd(tempdat)
+}
+
+# now calculate the number of times the sd exceeds that of the real data
+
+pval.wd50$sdExceed=0
+
+wd50.sd=sd(ttrExp$total.eff[ttrExp$treat=="wd50"])
+
+pval.wd50$sdExceed[pval.wd50$sd>wd50.sd]=1
+
+bpval.self.gamma$sd.pval[5]=sum(pval.wd50$sdExceed==1)/nrow(pval.wd50) # if this value is < 0.1 for >0.9 that would suggest model is not fitting well. 0.5 is ideal
+
+#### Pb WE50 ####
+pval.we50=data.frame(shape=rep(NA,nrow(pars.we50.gamma)),
+                     rate=NA,
+                     sd=NA)
+set.seed(10)
+for(i in 1:nrow(pars.we50.gamma)){
+  tempdat=rgamma(n=length(ttrExp$total.eff[ttrExp$treat=="we50"]),
+                shape = pars.we50.gamma[i,1],
+                rate = pars.we50.gamma[i,2])
+  pval.we50$shape[i]=pars.we50.gamma[i,1]
+  pval.we50$rate[i]=pars.we50.gamma[i,2]
+  pval.we50$sd[i]=sd(tempdat)
+}
+
+# now calculate the number of times the sd exceeds that of the real data
+
+pval.we50$sdExceed=0
+
+we50.sd=sd(ttrExp$total.eff[ttrExp$treat=="we50"])
+
+pval.we50$sdExceed[pval.we50$sd>we50.sd]=1
+
+bpval.self.gamma$sd.pval[6]=sum(pval.we50$sdExceed==1)/nrow(pval.we50) # if this value is < 0.1 for >0.9 that would suggest model is not fitting well. 0.5 is ideal
+
+kable(bpval.self.gamma, digits = 3, col.names = c("Scenario", "SD p-value"), align="lcc",caption = "Bayesian p-values for a gamma distributed model. Each p-value describes whether or not there is a significant difference between data generated by the fitted model and the actual data for that scenario. Standard devidation (SD) was the metric assessed here.")
+```
+
+The Bayesian p-values in the table presented here suggests the gamma models do a poor job of reproducing the data they were fit to (Table \@ref(tab:gammaPVals)).
+This inference comes from the lack of p-values between 0.1 - 0.9 for the SD metric.
+Because this model is unable to reproduce the data it was fit to, we know that this model is not a useful one for fitting these data.
+This means that the gamma distribution not likely to be appropriate for making comparisons between the actual data and the reduced data to understand whether or not creel effort reductions result in significantly different annual angler effort per hectare estimates or not.
+
+### P-value sensitivity analysis
+
+#### Interpreting each statistic
+
+Some more detail on what I'm looking for in each statistic and what the values mean that are used to calculate each Bayesian p-value.
+It's important to remember that the way the sampling algorithm works in this Bayesian framework the frequency of values in the MCMC output is relative to their support in the data.
+In other words, parameter values that produce better models fits show up in the chain more often.
+This is critical to understanding the Bayesian p-values here because each test statistic is calculated for simulated data based on the MCMC output so each test statistic value should appear with a frequency equal to the support provided by the data too.
+For example, the medians calculated from data sets produced by each parameter set in the MCMC output should produce medians that have frequencies equal to how well those parameters fit the data.
+Thus medians well below the median of the observed data should be pretty rare (and likewise for medians well above) because the parameter set from the MCMC chain that produces data with said median should be relatively infrequent in the MCMC output.
+Medians close to the median of the observed data should be more common, if the model is fitting the data well, because the parameters generating those means are more common in the MCMC output due to the better fit to the data they provide.
+This results in medians that are often close to the median of the observed data and by random chance should be just as likely to be above as below the median of the observed data.
+This is why Bayesian p-values close to 0.5 signify a good model fit, because about 50% of the time the test statistic is more extreme than the value for the observed data.
+If this values is extremely high or low then is signals that our model is not adequately representing the observed data.
+
+##### Standard Deviation
+
+Another straightforward calculation.
+SD is calculated for a data set drawn from a random lognormal distribution parameterized using the values in the MCMC chain.
+This is repeated for each set of parameter values in the MCMC chain to create as many simulated data sets as there are iterations in the MCMC chain.
+The SD of each of these simulated data sets is compared to the SD for the observed data for that scenario (Actual, No Winter, May - August, etc.).
+Whether the SD of the simulated data is greater than or less than the SD of the observed data is recorded.
+**If the model is able to reproduce the observed data well then the SD of the simulated data should be greater than the SD of the observed data about 50% of the time and less than the SD of the observed data about 50% of the time too.**
+
+##### Median
+
+Simple descriptive statistic here.
+The median is calculated for each simulated data set produced by drawing values from a random lognormal distribution parameterized using the values in the MCMC output.
+The number of times the median of the simulated data set exceeds the median of the observed data is calculated and that proportion of times the test statistic exceeds the value for the observed data is the Bayesian p-value.
+**If the model is adequately representing the data then the medians generated from the simulated data sets should exceed the median of the observed data roughly 50% of the time.**
+
+##### Kurtosis
+
+This metric essentially measures the shape of a distribution, specifically the tails.
+Kurtosis is calculated for the simulated data for each set of parameter values in the MCMC output and compared to the kurtosis of the observed data for the given scenario (Actual, No Winter, May - August, etc.).
+When the kurtosis value of the simulated data is greater than the kurtosis of the observed data this signals more frequent extreme values in the data.
+In other words the tails of the distribution of the simulated data are thicker than the tails of the distribution of the observed data.
+The opposite is true when the kurtosis of the simulated data is less than the kurtosis of the observed data.
+**A well-fitting model will produce data with kurtosis values similar to the the observed data's kurtosis. The kurtosis of the simulated data will exceed that of the observed data roughly 50% of the time. If the kurtosis of the simulated data is more frequently less than the observed data this would signal that the model is not doing well as representing the rare values in the tails of the data distribution. The opposite is true if kurtosis values for the simulated data tend to be larger than the observed data.**
+
+##### Chi Square Test ($\chi^2$)
+
+This test is performed outside the Bayesian p-value framework.
+Instead, each simulated data set arising from a set of parameters in the MCMC output is compared to the probability distribution of the observed data to ask whether the simulated data arises from the same distribution as the observed data.
+Again, because of the way the parameter space is sampled in MCMC algorithms the values that produce better model fits will be more common which means that in the $\chi^2$ test the null hypothesis that the data comes from the supplied probability distribution should be accepted more often than it's rejected.
+**If the null hypothesis is rejected the majority of the time that would indicate that the model is not adequately representing the data if it can't produce simulated data that would appear to be from the probability distribution of the observed data used to fit the model in the first place.**
+
+##### Fisher 'F' Statistic
+
+The F statistic is the ratio of variances between the simulated and observed data sets.
+For this test I'm looking to see if the F statistic for the simulated:observed comparison is greater than or less than 1 (the ratio of the variance for the observed:observed comparison).
+**The closer the F statistic is to 1 for the simulated:observed comparison the better job the model is doing at adequately representing the data. So the number of times the F statistic exceeds 1 should, if the model is fitting the data well, be about 50% of the time. If the Bayesian p-value is much higher than 0.5 that would indicate that the variance of the simulated data is often greater than the variance of the observed data. The opposite then is true when the p-value is smaller than 0.5**
+
+##### Coverage
+
+The probability that the confidence interval for the parameter of interest will include the true value of the data. Here this means comparing confidence intervals on the estimated fishery metric calculated from the reduced data set back to the calculation of the fishery metric for the full creel data set. This is repeated for each parameter value in the MCMC chain resulting from the model fits. 
+**The percentage of parameter values that produce fishery metric data that 'covers' what was observed in the full data set is what is reported. The higher the coverage, the better the reduced creel data set is able to approximate the full data set.**
+
+```{r pStatTab}
+tab=data.frame(statistic=c("SD","Median","Kurtosis","X2","F","Coverage"),
+               desription=c("Square root of the variance.",
+                            "Middle of the data when all values are ordered from smallest to largest. Similar to a mean but less sensitive to outlier values.",
+                            "Measure of the width, or 'tailedness' of a distribution. In other words, do the tails of the distribution contain more or fewer outliers (i.e. are they thicker or thinner)?",
+                            "Chi square test statistic for a 'goodness of fit' test is calculated. Here I want to know if frequency of values in the model generated data come from the same distribution as the observed data",
+                            "The ratio of the variance between the model simulated data and the observed data.",
+                            "The probability that the 95 percent confidence interval for a paramter will contain the true value of the data."))
+kable(tab,col.names=c('Statistic', 'Description'),align="cl",caption = "Candidate variance metrics to use for calculation of Bayesian p-values.")
+```
+
+```{r bpValCalcsAlternateMetrics}
+
+# bayesian p-value for each model
+pars.a=getSample(eff.actual)
+pars.nw=getSample(eff.nw)
+pars.ma=getSample(eff.ma)
+pars.wd25=getSample(eff.25wd)
+pars.wd50=getSample(eff.50wd)
+pars.we50=getSample(eff.50we)
+
+#### Pb ACTUAL ####
+pval.actual=data.frame(alpha=rep(NA,nrow(pars.a)),
+                       beta=NA,
+                       sd=NA,
+                       med=NA,
+                       kurt=NA,
+                       x2=NA,
+                       f=NA,
+                       lcl=NA,
+                       ucl=NA)
+set.seed(10)
+for(i in 1:nrow(pars.a)){
+  tempdat=rlnorm(n=length(modDat$total.eff[modDat$treat=="actual"]),
+                 meanlog = pars.a[i,1],
+                 sdlog = pars.a[i,2])
+  pval.actual$alpha[i]=pars.a[i,1]
+  pval.actual$beta[i]=pars.a[i,2]
+  pval.actual$sd[i]=sd(log(tempdat))
+  pval.actual$med[i]=median(log(tempdat))
+  pval.actual$kurt[i]=kurtosis(log(tempdat))
+  ct=chisq.test(tempdat, p=modDat$total.eff[modDat$treat=="actual"], rescale.p = T)
+  pval.actual$x2[i]=ct$p.value
+  f.test=var.test(log(tempdat),log(modDat$total.eff[modDat$treat=="actual"]))
+  pval.actual$f[i]=f.test$statistic
+  cis=quantile(log(tempdat), probs=c(0.025, 0.975))
+  pval.actual$lcl[i]=cis[1]
+  pval.actual$ucl[i]=cis[2]
+  
+}
+
+# now calculate the number of times the test statistic exceeds that of the real data
+
+pval.actual$sdExceed=0
+pval.actual$medExceed=0
+pval.actual$kurtExceed=0
+pval.actual$x2SigDiff=0
+pval.actual$fStatExceed=0
+pval.actual$coverageExceed=0
+
+actual.sd=sd(log(modDat$total.eff[modDat$treat=="actual"]))
+actual.med=median(log(modDat$total.eff[modDat$treat=="actual"]))
+actual.kurt=kurtosis(log(modDat$total.eff[modDat$treat=="actual"]))
+actual.x2=chisq.test(modDat$total.eff[modDat$treat=="actual"],p=modDat$total.eff[modDat$treat=="actual"],rescale.p = T)
+actual.f=var.test(log(modDat$total.eff[modDat$treat=="actual"]),log(modDat$total.eff[modDat$treat=="actual"]))
+
+pval.actual$sdExceed[pval.actual$sd>actual.sd]=1
+pval.actual$medExceed[pval.actual$med>actual.med]=1
+pval.actual$kurtExceed[pval.actual$kurt>actual.kurt]=1 # kurt value great that observed data means there are more outliers, or thicker tails than the observed data
+pval.actual$x2SigDiff[pval.actual$x2<0.05]=1 # looking at how often we would say the simmed data did not come from the probability distribution of the actual data
+pval.actual$fStatExceed[pval.actual$f>actual.f$statistic]=1 # how often the f statistic is bigger than the actual
+pval.actual$coverageExceed[pval.actual$lcl<=mean(log(modDat$total.eff[modDat$treat=="actual"])) & pval.actual$ucl>=mean(log(modDat$total.eff[modDat$treat=="actual"]))]=1 # how often the cis from the temp data contain the mean of the actual data
+
+
+#### Pb NoWinter ####
+pval.noWinter=data.frame(alpha=rep(NA,nrow(pars.nw)),
+                         beta=NA,
+                         sd=NA,
+                         med=NA,
+                         kurt=NA,
+                         x2=NA,
+                         f=NA,
+                         lcl=NA,
+                         ucl=NA)
+set.seed(10)
+for(i in 1:nrow(pars.nw)){
+  tempdat=rlnorm(n=length(modDat$total.eff[modDat$treat=="noWinter"]),
+                 meanlog = pars.nw[i,1],
+                 sdlog = pars.nw[i,2])
+  pval.noWinter$alpha[i]=pars.nw[i,1]
+  pval.noWinter$beta[i]=pars.nw[i,2]
+  pval.noWinter$sd[i]=sd(log(tempdat))
+  pval.noWinter$med[i]=median(log(tempdat))
+  pval.noWinter$kurt[i]=kurtosis(log(tempdat))
+  ct=chisq.test(tempdat, p=modDat$total.eff[modDat$treat=="noWinter"], rescale.p = T)
+  pval.noWinter$x2[i]=ct$p.value
+  f.test=var.test(log(tempdat),log(modDat$total.eff[modDat$treat=="noWinter"]))
+  pval.noWinter$f[i]=f.test$statistic
+  cis=quantile(log(tempdat), probs=c(0.025, 0.975))
+  pval.noWinter$lcl[i]=cis[1]
+  pval.noWinter$ucl[i]=cis[2]
+}
+
+# now calculate the number of times the test statistic exceeds that of the real data
+
+pval.noWinter$sdExceed=0
+pval.noWinter$medExceed=0
+pval.noWinter$kurtExceed=0
+pval.noWinter$x2SigDiff=0
+pval.noWinter$fStatExceed=0
+pval.noWinter$coverageExceed=0
+
+noWinter.sd=sd(log(modDat$total.eff[modDat$treat=="noWinter"]))
+noWinter.med=median(log(modDat$total.eff[modDat$treat=="noWinter"]))
+noWinter.kurt=kurtosis(log(modDat$total.eff[modDat$treat=="noWinter"]))
+noWinter.x2=chisq.test(modDat$total.eff[modDat$treat=="noWinter"],p=modDat$total.eff[modDat$treat=="noWinter"],rescale.p = T)
+noWinter.f=var.test(log(modDat$total.eff[modDat$treat=="noWinter"]),log(modDat$total.eff[modDat$treat=="noWinter"]))
+
+pval.noWinter$sdExceed[pval.noWinter$sd>noWinter.sd]=1
+pval.noWinter$medExceed[pval.noWinter$med>noWinter.med]=1
+pval.noWinter$kurtExceed[pval.noWinter$kurt>noWinter.kurt]=1 # kurt value great that observed data means there are more outliers, or thicker tails than the observed data
+pval.noWinter$x2SigDiff[pval.noWinter$x2<0.05]=1 # looking at how often we would say the simmed data did not come from the probabilit distribution of the noWinter data
+pval.noWinter$fStatExceed[pval.noWinter$f>noWinter.f$statistic]=1 # how often the f statistic is bigger than the noWinter
+pval.noWinter$coverageExceed[pval.noWinter$lcl<=mean(log(modDat$total.eff[modDat$treat=="noWinter"])) & pval.noWinter$ucl>=mean(log(modDat$total.eff[modDat$treat=="noWinter"]))]=1 # how often the cis from the temp data contain the mean of the noWinter data
+
+#### Pb MayAug ####
+pval.mayAug=data.frame(alpha=rep(NA,nrow(pars.ma)),
+                       beta=NA,
+                       sd=NA,
+                       med=NA,
+                       kurt=NA,
+                       x2=NA,
+                       f=NA,
+                       lcl=NA,
+                       ucl=NA)
+set.seed(10)
+for(i in 1:nrow(pars.ma)){
+  tempdat=rlnorm(n=length(modDat$total.eff[modDat$treat=="mayAug"]),
+                 meanlog = pars.ma[i,1],
+                 sdlog = pars.ma[i,2])
+  pval.mayAug$alpha[i]=pars.ma[i,1]
+  pval.mayAug$beta[i]=pars.ma[i,2]
+  pval.mayAug$sd[i]=sd(log(tempdat))
+  pval.mayAug$med[i]=median(log(tempdat))
+  pval.mayAug$kurt[i]=kurtosis(log(tempdat))
+  ct=chisq.test(tempdat, p=modDat$total.eff[modDat$treat=="mayAug"], rescale.p = T)
+  pval.mayAug$x2[i]=ct$p.value
+  f.test=var.test(log(tempdat),log(modDat$total.eff[modDat$treat=="mayAug"]))
+  pval.mayAug$f[i]=f.test$statistic
+  cis=quantile(log(tempdat), probs=c(0.025, 0.975))
+  pval.mayAug$lcl[i]=cis[1]
+  pval.mayAug$ucl[i]=cis[2]
+}
+
+# now calculate the number of times the test statistic exceeds that of the real data
+
+pval.mayAug$sdExceed=0
+pval.mayAug$medExceed=0
+pval.mayAug$kurtExceed=0
+pval.mayAug$x2SigDiff=0
+pval.mayAug$fStatExceed=0
+pval.mayAug$coverageExceed=0
+
+mayAug.sd=sd(log(modDat$total.eff[modDat$treat=="mayAug"]))
+mayAug.med=median(log(modDat$total.eff[modDat$treat=="mayAug"]))
+mayAug.kurt=kurtosis(log(modDat$total.eff[modDat$treat=="mayAug"]))
+mayAug.x2=chisq.test(modDat$total.eff[modDat$treat=="mayAug"],p=modDat$total.eff[modDat$treat=="mayAug"],rescale.p = T)
+mayAug.f=var.test(log(modDat$total.eff[modDat$treat=="mayAug"]),log(modDat$total.eff[modDat$treat=="mayAug"]))
+
+pval.mayAug$sdExceed[pval.mayAug$sd>mayAug.sd]=1
+pval.mayAug$medExceed[pval.mayAug$med>mayAug.med]=1
+pval.mayAug$kurtExceed[pval.mayAug$kurt>mayAug.kurt]=1 # kurt value great that observed data means there are more outliers, or thicker tails than the observed data
+pval.mayAug$x2SigDiff[pval.mayAug$x2<0.05]=1 # looking at how often we would say the simmed data did not come from the probabilit distribution of the mayAug data
+pval.mayAug$fStatExceed[pval.mayAug$f>mayAug.f$statistic]=1 # how often the f statistic is bigger than the mayAug
+pval.mayAug$coverageExceed[pval.mayAug$lcl<=mean(log(modDat$total.eff[modDat$treat=="mayAug"])) & pval.mayAug$ucl>=mean(log(modDat$total.eff[modDat$treat=="mayAug"]))]=1 # how often the cis from the temp data contain the mean of the mayAug data
+
+#### Pb WD25 ####
+pval.wd25=data.frame(alpha=rep(NA,nrow(pars.wd25)),
+                     beta=NA,
+                     sd=NA,
+                     med=NA,
+                     kurt=NA,
+                     x2=NA,
+                     f=NA,
+                     lcl=NA,
+                     ucl=NA)
+set.seed(10)
+for(i in 1:nrow(pars.wd25)){
+  tempdat=rlnorm(n=length(modDat$total.eff[modDat$treat=="wd25"]),
+                 meanlog = pars.wd25[i,1],
+                 sdlog = pars.wd25[i,2])
+  pval.wd25$alpha[i]=pars.wd25[i,1]
+  pval.wd25$beta[i]=pars.wd25[i,2]
+  pval.wd25$sd[i]=sd(log(tempdat))
+  pval.wd25$med[i]=median(log(tempdat))
+  pval.wd25$kurt[i]=kurtosis(log(tempdat))
+  ct=chisq.test(tempdat, p=modDat$total.eff[modDat$treat=="wd25"], rescale.p = T)
+  pval.wd25$x2[i]=ct$p.value
+  f.test=var.test(log(tempdat),log(modDat$total.eff[modDat$treat=="wd25"]))
+  pval.wd25$f[i]=f.test$statistic
+  cis=quantile(log(tempdat), probs=c(0.025, 0.975))
+  pval.wd25$lcl[i]=cis[1]
+  pval.wd25$ucl[i]=cis[2]
+}
+
+# now calculate the number of times the test statistic exceeds that of the real data
+
+pval.wd25$sdExceed=0
+pval.wd25$medExceed=0
+pval.wd25$kurtExceed=0
+pval.wd25$x2SigDiff=0
+pval.wd25$fStatExceed=0
+pval.wd25$coverageExceed=0
+
+wd25.sd=sd(log(modDat$total.eff[modDat$treat=="wd25"]))
+wd25.med=median(log(modDat$total.eff[modDat$treat=="wd25"]))
+wd25.kurt=kurtosis(log(modDat$total.eff[modDat$treat=="wd25"]))
+wd25.x2=chisq.test(modDat$total.eff[modDat$treat=="wd25"],p=modDat$total.eff[modDat$treat=="wd25"],rescale.p = T)
+wd25.f=var.test(log(modDat$total.eff[modDat$treat=="wd25"]),log(modDat$total.eff[modDat$treat=="wd25"]))
+
+pval.wd25$sdExceed[pval.wd25$sd>wd25.sd]=1
+pval.wd25$medExceed[pval.wd25$med>wd25.med]=1
+pval.wd25$kurtExceed[pval.wd25$kurt>wd25.kurt]=1 # kurt value great that observed data means there are more outliers, or thicker tails than the observed data
+pval.wd25$x2SigDiff[pval.wd25$x2<0.05]=1 # looking at how often we would say the simmed data did not come from the probabilit distribution of the wd25 data
+pval.wd25$fStatExceed[pval.wd25$f>wd25.f$statistic]=1 # how often the f statistic is bigger than the wd25
+pval.wd25$coverageExceed[pval.wd25$lcl<=mean(log(modDat$total.eff[modDat$treat=="wd25"])) & pval.wd25$ucl>=mean(log(modDat$total.eff[modDat$treat=="wd25"]))]=1 # how often the cis from the temp data contain the mean of the wd25 data
+
+#### Pb WD50 ####
+pval.wd50=data.frame(alpha=rep(NA,nrow(pars.wd50)),
+                     beta=NA,
+                     sd=NA,
+                     med=NA,
+                     kurt=NA,
+                     x2=NA,
+                     f=NA,
+                     lcl=NA,
+                     ucl=NA)
+set.seed(10)
+for(i in 1:nrow(pars.wd50)){
+  tempdat=rlnorm(n=length(modDat$total.eff[modDat$treat=="wd50"]),
+                 meanlog = pars.wd50[i,1],
+                 sdlog = pars.wd50[i,2])
+  pval.wd50$alpha[i]=pars.wd50[i,1]
+  pval.wd50$beta[i]=pars.wd50[i,2]
+  pval.wd50$sd[i]=sd(log(tempdat))
+  pval.wd50$med[i]=median(log(tempdat))
+  pval.wd50$kurt[i]=kurtosis(log(tempdat))
+  ct=chisq.test(tempdat, p=modDat$total.eff[modDat$treat=="wd50"], rescale.p = T)
+  pval.wd50$x2[i]=ct$p.value
+  f.test=var.test(log(tempdat),log(modDat$total.eff[modDat$treat=="wd50"]))
+  pval.wd50$f[i]=f.test$statistic
+  cis=quantile(log(tempdat), probs=c(0.025, 0.975))
+  pval.wd50$lcl[i]=cis[1]
+  pval.wd50$ucl[i]=cis[2]
+}
+
+# now calculate the number of times the test statistic exceeds that of the real data
+
+pval.wd50$sdExceed=0
+pval.wd50$medExceed=0
+pval.wd50$kurtExceed=0
+pval.wd50$x2SigDiff=0
+pval.wd50$fStatExceed=0
+pval.wd50$coverageExceed=0
+
+wd50.sd=sd(log(modDat$total.eff[modDat$treat=="wd50"]))
+wd50.med=median(log(modDat$total.eff[modDat$treat=="wd50"]))
+wd50.kurt=kurtosis(log(modDat$total.eff[modDat$treat=="wd50"]))
+wd50.x2=chisq.test(modDat$total.eff[modDat$treat=="wd50"],p=modDat$total.eff[modDat$treat=="wd50"],rescale.p = T)
+wd50.f=var.test(log(modDat$total.eff[modDat$treat=="wd50"]),log(modDat$total.eff[modDat$treat=="wd50"]))
+
+pval.wd50$sdExceed[pval.wd50$sd>wd50.sd]=1
+pval.wd50$medExceed[pval.wd50$med>wd50.med]=1
+pval.wd50$kurtExceed[pval.wd50$kurt>wd50.kurt]=1 # kurt value great that observed data means there are more outliers, or thicker tails than the observed data
+pval.wd50$x2SigDiff[pval.wd50$x2<0.05]=1 # looking at how often we would say the simmed data did not come from the probabilit distribution of the wd50 data
+pval.wd50$fStatExceed[pval.wd50$f>wd50.f$statistic]=1 # how often the f statistic is bigger than the wd50
+pval.wd50$coverageExceed[pval.wd50$lcl<=mean(log(modDat$total.eff[modDat$treat=="wd50"])) & pval.wd50$ucl>=mean(log(modDat$total.eff[modDat$treat=="wd50"]))]=1 # how often the cis from the temp data contain the mean of the wd50 data
+
+#### Pb WE50 ####
+pval.we50=data.frame(alpha=rep(NA,nrow(pars.we50)),
+                     beta=NA,
+                     sd=NA,
+                     med=NA,
+                     kurt=NA,
+                     x2=NA,
+                     f=NA,
+                     lcl=NA,
+                     ucl=NA)
+set.seed(10)
+for(i in 1:nrow(pars.we50)){
+  tempdat=rlnorm(n=length(modDat$total.eff[modDat$treat=="we50"]),
+                 meanlog = pars.we50[i,1],
+                 sdlog = pars.we50[i,2])
+  pval.we50$alpha[i]=pars.we50[i,1]
+  pval.we50$beta[i]=pars.we50[i,2]
+  pval.we50$sd[i]=sd(log(tempdat))
+  pval.we50$med[i]=median(log(tempdat))
+  pval.we50$kurt[i]=kurtosis(log(tempdat))
+  ct=chisq.test(tempdat, p=modDat$total.eff[modDat$treat=="we50"], rescale.p = T)
+  pval.we50$x2[i]=ct$p.value
+  f.test=var.test(log(tempdat),log(modDat$total.eff[modDat$treat=="we50"]))
+  pval.we50$f[i]=f.test$statistic
+  cis=quantile(log(tempdat), probs=c(0.025, 0.975))
+  pval.we50$lcl[i]=cis[1]
+  pval.we50$ucl[i]=cis[2]
+}
+
+# now calculate the number of times the test statistic exceeds that of the real data
+
+pval.we50$sdExceed=0
+pval.we50$medExceed=0
+pval.we50$kurtExceed=0
+pval.we50$x2SigDiff=0
+pval.we50$fStatExceed=0
+pval.we50$coverageExceed=0
+
+we50.sd=sd(log(modDat$total.eff[modDat$treat=="we50"]))
+we50.med=median(log(modDat$total.eff[modDat$treat=="we50"]))
+we50.kurt=kurtosis(log(modDat$total.eff[modDat$treat=="we50"]))
+we50.x2=chisq.test(modDat$total.eff[modDat$treat=="we50"],p=modDat$total.eff[modDat$treat=="we50"],rescale.p = T)
+we50.f=var.test(log(modDat$total.eff[modDat$treat=="we50"]),log(modDat$total.eff[modDat$treat=="we50"]))
+
+pval.we50$sdExceed[pval.we50$sd>we50.sd]=1
+pval.we50$medExceed[pval.we50$med>we50.med]=1
+pval.we50$kurtExceed[pval.we50$kurt>we50.kurt]=1 # kurt value great that observed data means there are more outliers, or thicker tails than the observed data
+pval.we50$x2SigDiff[pval.we50$x2<0.05]=1 # looking at how often we would say the simmed data did not come from the probabilit distribution of the we50 data
+pval.we50$fStatExceed[pval.we50$f>we50.f$statistic]=1 # how often the f statistic is bigger than the we50
+pval.we50$coverageExceed[pval.we50$lcl<=mean(log(modDat$total.eff[modDat$treat=="we50"])) & pval.we50$ucl>=mean(log(modDat$total.eff[modDat$treat=="we50"]))]=1 # how often the cis from the temp data contain the mean of the we50 data
+
+# the following will all be 1 if all parm values in the chain produce data with a CI that covers the mean from the actual creel data.
+# (sum(pval.actual$coverageExceed)/nrow(pval.actual))*100
+# (sum(pval.noWinter$coverageExceed)/nrow(pval.noWinter))*100
+# (sum(pval.mayAug$coverageExceed)/nrow(pval.mayAug))*100
+# (sum(pval.wd25$coverageExceed)/nrow(pval.wd25))*100
+# (sum(pval.wd50$coverageExceed)/nrow(pval.wd50))*100
+# (sum(pval.we50$coverageExceed)/nrow(pval.we50))*100
+
+```
+
+```{r bpValCalcPLOT, fig.cap="Comparison of multiple metrics for calculating Bayesian p-values. Each panel is a different data scenario. The comparisons in each panel are comparing the model simulated data to the observed data for that same sencario, NOT comparing model simulated data from a reduction scenario tot he actual data. This comparison to self is to understand whether the model is adequately representing the data and whether the choice of statistic influences the answer to that question. Values close to 0.5 are ideal, values more extreme than 0.1 or 0.9 are considered evidence for a poor model fit (i.e. significant difference betweek model simulated data and the observed data)."}
+### summarizing pvalue output
+# reminder this is all comparison to self
+
+# making a list object with all the pval objects
+self.pvals=list(pval.actual, pval.noWinter, pval.mayAug, pval.wd25, pval.wd50, pval.we50)
+
+all.self.pvals=data.frame(dataSet=c(rep("actual",5),rep("noWinter",5),rep("mayAug",5),rep("wd25",5),rep("wd50",5),rep("we50",5)),
+                          measure=rep(c("sd","med","kurt","x2Sig","f"),6),
+                          pval=NA)
+
+for(i in 1:length(self.pvals)){
+  tp=self.pvals[[i]]
+  datSet=unique(all.self.pvals$dataSet)[i]
+  
+  all.self.pvals$pval[all.self.pvals$dataSet==datSet & all.self.pvals$measure=="sd"]=sum(tp$sdExceed==1)/nrow(tp)
+  all.self.pvals$pval[all.self.pvals$dataSet==datSet & all.self.pvals$measure=="med"]=sum(tp$medExceed==1)/nrow(tp)
+  all.self.pvals$pval[all.self.pvals$dataSet==datSet & all.self.pvals$measure=="kurt"]=sum(tp$kurtExceed==1)/nrow(tp)
+  all.self.pvals$pval[all.self.pvals$dataSet==datSet & all.self.pvals$measure=="x2Sig"]=sum(tp$x2SigDiff==1)/nrow(tp)
+  all.self.pvals$pval[all.self.pvals$dataSet==datSet & all.self.pvals$measure=="f"]=sum(tp$fStatExceed==1)/nrow(tp)
+}
+
+# not including x2 for this plot since I'm using the calculation differently. Shows kurtosis as the only pval metric that is markedly different from the rest
+ggplot(all.self.pvals[all.self.pvals$measure!="x2Sig",])+theme_classic()+
+  geom_point(aes(x=measure, y=pval), size=2)+facet_wrap(~dataSet)+
+  geom_hline(yintercept = c(0.1,0.9), linetype=2)+
+  geom_hline(yintercept = 0.5, linetype=4)+
+  labs(y="Bayesian p-value", x="Metric")
+
+```

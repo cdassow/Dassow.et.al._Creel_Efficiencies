@@ -1,0 +1,12 @@
+.Rhistory
+exploitationRate_cache/
+exploitationRate_files/
+effort_files/
+effort_cache/
+catch_files/
+catch_cache/
+harvest_files/
+harvest_cache/
+harvestRate_files/
+harvestRate_cache/
+*.log
